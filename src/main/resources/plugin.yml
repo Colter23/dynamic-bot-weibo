@@ -5,3 +5,14 @@ mainClass: top.colter.dynamic.weibo.WeiboPublisherPlugin
 apiVersion: 4.0.0
 description: 微博动态轮询、发布者资料查询、关注分组与订阅分发插件。
 author: dynamic-bot
+drawAssets:
+  - platformId: weibo
+    key: logo.primary
+    kind: LOGO
+    resourcePath: draw/weibo/logo/primary.png
+    mimeType: image/png
+  - platformId: weibo
+    key: logo.wordmark
+    kind: LOGO
+    resourcePath: draw/weibo/logo/wordmark.png
+    mimeType: image/png
