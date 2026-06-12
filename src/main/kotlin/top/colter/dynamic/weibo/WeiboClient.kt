@@ -46,34 +46,30 @@ internal class WeiboClient(
     private val config: WeiboPublisherConfig,
     private val httpClient: HttpClient = defaultHttpClient(config.cookie),
 ) {
+    private var cachedLoginAccount: PublisherLoginAccount? = null
+
     suspend fun checkLoginState(): PublisherLoginResult {
-        val root = getJson(
-            path = "/ajax/getNavConfig",
-            parameters = emptyList(),
-            referer = WEIBO_HOME,
-        )
-        val loggedIn = parseLoginStateResponse(root)
-        if (!loggedIn) {
+        val hasCookie = config.cookie.trim().isNotBlank()
+        if (!hasCookie) {
             return PublisherLoginResult(
                 status = PublisherLoginStatus.FAILED,
-                message = "微博登录状态不可用",
+                message = "微博 Cookie 未配置",
             )
         }
 
-        val account = resolveLoginAccount()
+        val account = fetchCurrentAccount()
+        if (account == null) {
+            return PublisherLoginResult(
+                status = PublisherLoginStatus.FAILED,
+                message = "微博登录状态不可用：PC 首页未包含当前账号信息",
+            )
+        }
+
         return PublisherLoginResult(
             status = PublisherLoginStatus.SUCCESS,
             message = "微博登录状态可用",
             account = account,
         )
-    }
-
-    internal fun parseLoginStateResponse(json: String): Boolean {
-        return parseLoginStateResponse(WEIBO_JSON.parseToJsonElement(json))
-    }
-
-    internal fun parseLoginStateResponse(json: JsonElement): Boolean {
-        return json.asObject()?.isExplicitOk() == true
     }
 
     internal fun exportCookieHeader(): String {
@@ -91,57 +87,12 @@ internal class WeiboClient(
         if (response.statusCode() !in 200..299) {
             throw WeiboApiException("微博首页请求失败：status=${response.statusCode()}")
         }
-        val account = parseHomeAccountResponse(response.body())
-        if (account != null) return account
-        val headerUid = response.headerUid()
-        logger.warn {
-            "微博首页账号 JSON 未解析，尝试响应头 UID：status=${response.statusCode()}，" +
-                "uri=${response.uri()}，contentType=${response.headers().firstValue("content-type").orElse("未知")}，" +
-                "bodyLength=${response.body().length}，containsConfig=${response.body().contains(WINDOW_CONFIG_MARKER)}，" +
-                "headerUid=${headerUid ?: "无"}，redirectChain=${response.redirectChainSummary()}"
-        }
-        return headerUid?.let { PublisherLoginAccount(userId = it) }
+        return parseHomeAccountResponse(response.body())
     }
 
     internal fun parseHomeAccountResponse(html: String): PublisherLoginAccount? {
         val root = extractJsConfigObject(html) ?: return null
         return root.obj("user")?.toPublisherSnapshot()?.toLoginAccount()
-            ?: root.string("uid")?.takeIf { it.isNotBlank() }?.let { PublisherLoginAccount(userId = it) }
-            ?: root.long("uid")?.toString()?.let { PublisherLoginAccount(userId = it) }
-    }
-
-    suspend fun fetchMobileConfigUid(): String? {
-        val response = sendTextRequest(
-            uri = URI.create("$MOBILE_WEIBO_HOME/api/config"),
-            referer = "$MOBILE_WEIBO_HOME/?&jumpfrom=weibocom",
-            accept = "application/json, text/plain, */*",
-            mobile = true,
-        )
-        val root = parseHttpJsonResponse(
-            statusCode = response.statusCode(),
-            path = "/api/config",
-            body = response.body(),
-        )
-        val parsedUid = parseMobileConfigUidResponse(root)
-        if (parsedUid != null) return parsedUid
-        val headerUid = response.headerUid()
-        logger.warn {
-            "微博移动端配置未解析到 UID，尝试响应头 UID：status=${response.statusCode()}，" +
-                "uri=${response.uri()}，bodyLength=${response.body().length}，headerUid=${headerUid ?: "无"}"
-        }
-        return headerUid
-    }
-
-    internal fun parseMobileConfigUidResponse(json: String): String? {
-        return parseMobileConfigUidResponse(WEIBO_JSON.parseToJsonElement(json))
-    }
-
-    internal fun parseMobileConfigUidResponse(json: JsonElement): String? {
-        val root = json.asObject() ?: return null
-        if (!root.isOk()) return null
-        val data = root.obj("data") ?: return null
-        if (data.boolean("login") != true) return null
-        return data.string("uid") ?: data.long("uid")?.toString()
     }
 
     suspend fun fetchPublisherInfo(userId: String): WeiboPublisherSnapshot? {
@@ -442,9 +393,13 @@ internal class WeiboClient(
         return root.obj("data")?.boolean("result") ?: root.boolean("result") ?: true
     }
 
-    internal fun configuredFriendTimelineListId(): String? {
-        val uid = config.loginUserId.trim()
-            .takeIf { it.isWeiboUid() }
+    suspend fun currentAccountFriendTimelineListId(): String? {
+        return friendTimelineListIdForAccount(fetchCurrentAccount())
+    }
+
+    internal fun friendTimelineListIdForAccount(account: PublisherLoginAccount?): String? {
+        val uid = account?.userId
+            ?.takeIf { it.isWeiboUid() }
             ?: return null
         return "$DEFAULT_FRIEND_TIMELINE_LIST_PREFIX$uid"
     }
@@ -554,21 +509,17 @@ internal class WeiboClient(
         referer: String,
         accept: String,
         xRequestedWith: Boolean = true,
-        mobile: Boolean = false,
         desktopDocument: Boolean = false,
     ): HttpResponse<String> {
         val request = HttpRequest.newBuilder(uri)
             .timeout(Duration.ofSeconds(15))
             .header("Accept", accept)
             .header("Accept-Language", "zh-CN,zh;q=0.9")
-            .header("User-Agent", if (mobile) MOBILE_USER_AGENT else DESKTOP_USER_AGENT)
+            .header("User-Agent", DESKTOP_USER_AGENT)
             .header("Referer", referer)
             .apply {
                 if (xRequestedWith) {
                     header("X-Requested-With", "XMLHttpRequest")
-                }
-                if (mobile) {
-                    header("MWeibo-Pwa", "1")
                 }
                 if (desktopDocument) {
                     header("Cache-Control", "max-age=0")
@@ -1101,89 +1052,25 @@ internal class WeiboClient(
             ?.firstOrNull(String::isNotBlank)
     }
 
-    private suspend fun resolveLoginAccount(): PublisherLoginAccount? {
-        val homeAccount = try {
+    private suspend fun fetchCurrentAccount(): PublisherLoginAccount? {
+        cachedLoginAccount?.let { return it }
+        val account = try {
             fetchHomeAccount()
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
-            logger.warn {
-                "微博当前账号解析失败：source=pc_home，原因=${error.message ?: error::class.simpleName}"
-            }
-            logger.debug(error) { "微博当前账号 PC 首页解析异常详情" }
+            logger.debug(error) { "微博当前账号 PC 首页解析异常" }
             null
         }
-        if (homeAccount != null) {
-            logger.info {
-                "微博当前账号识别成功：source=pc_home，uid=${homeAccount.userId ?: "未知"}，name=${homeAccount.name ?: "未知"}"
-            }
-            return homeAccount
-        }
-        logger.warn { "微博当前账号解析未命中：source=pc_home，未找到 window.\$CONFIG.user 或响应头 UID" }
-
-        val mobileUid = try {
-            fetchMobileConfigUid()
-        } catch (error: CancellationException) {
-            throw error
-        } catch (error: Throwable) {
-            logger.warn {
-                "微博当前账号解析失败：source=mobile_config，原因=${error.message ?: error::class.simpleName}"
-            }
-            logger.debug(error) { "微博当前账号移动端配置解析异常详情" }
-            null
-        }
-        if (!mobileUid.isNullOrBlank()) {
-            val account = try {
-                fetchPublisherInfo(mobileUid)?.toLoginAccount()
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Throwable) {
-                logger.warn {
-                    "微博当前账号资料补全失败：uid=$mobileUid，原因=${error.message ?: error::class.simpleName}"
-                }
-                logger.debug(error) { "微博当前账号资料补全异常详情" }
-                null
-            } ?: PublisherLoginAccount(userId = mobileUid)
-            logger.info {
-                "微博当前账号识别成功：source=mobile_config，uid=${account.userId ?: mobileUid}，name=${account.name ?: "未知"}"
-            }
-            return account
-        }
-        logger.warn { "微博当前账号解析未命中：source=mobile_config，未找到已登录 UID" }
-
-        val configuredUid = config.loginUserId.trim().takeIf { it.isNotBlank() }
-        if (configuredUid == null) {
-            logger.warn { "微博当前账号识别失败：PC 首页、移动端配置和 loginUserId 均未提供账号 UID" }
+        if (account == null) {
+            logger.debug { "微博当前账号识别失败：PC 首页未包含 window.\$CONFIG.user" }
             return null
         }
-        val account = try {
-            fetchPublisherInfo(configuredUid)?.toLoginAccount()
-        } catch (error: CancellationException) {
-            throw error
-        } catch (error: Throwable) {
-            logger.warn {
-                "微博配置账号资料补全失败：uid=$configuredUid，原因=${error.message ?: error::class.simpleName}"
-            }
-            logger.debug(error) { "微博配置账号资料补全异常详情" }
-            null
-        } ?: PublisherLoginAccount(userId = configuredUid)
+        cachedLoginAccount = account
         logger.info {
-            "微博当前账号识别成功：source=config，uid=${account.userId ?: configuredUid}，name=${account.name ?: "未知"}"
+            "微博当前账号识别成功：source=pc_home，uid=${account.userId ?: "未知"}，name=${account.name ?: "未知"}"
         }
         return account
-    }
-
-    private fun HttpResponse<*>.headerUid(): String? {
-        return headers().firstValue("x-log-uid").orElse(null)?.takeIf { it.isNotBlank() }
-            ?: headers().firstValue("x-bypass-uid").orElse(null)?.takeIf { it.isNotBlank() }
-    }
-
-    private fun HttpResponse<*>.redirectChainSummary(): String {
-        val previous = generateSequence(previousResponse().orElse(null)) { response ->
-            response.previousResponse().orElse(null)
-        }.toList().asReversed()
-        return (previous + this)
-            .joinToString(" -> ") { response -> "${response.statusCode()}:${response.uri()}" }
     }
 
     private fun currentCookieHeader(): String {
@@ -1267,11 +1154,8 @@ internal class WeiboClient(
         private const val DEFAULT_FRIEND_TIMELINE_LIST_PREFIX: String = "11000"
         private const val DEFAULT_FRIEND_TIMELINE_TITLE: String = "最新微博"
         private const val FRIEND_TIMELINE_API_PATH: String = "statuses/friends/timeline"
-        private const val MOBILE_WEIBO_HOME: String = "https://m.weibo.cn"
         private const val DESKTOP_USER_AGENT: String =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0"
-        private const val MOBILE_USER_AGENT: String =
-            "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Mobile Safari/537.36"
         private const val UNKNOWN_WEIBO_USER_ID: String = "__unknown__"
         private const val UNKNOWN_WEIBO_USER_NAME: String = "未知微博用户"
         private const val WINDOW_CONFIG_MARKER: String = "window.\$CONFIG"
@@ -1397,11 +1281,11 @@ internal class WeiboHttpGateway(
 
     private suspend fun resolveFriendTimelineListId(): String {
         cachedFriendTimelineListId?.takeIf { it.isNotBlank() }?.let { return it }
-        val resolved = client.configuredFriendTimelineListId()
+        val resolved = client.currentAccountFriendTimelineListId()
             ?: withRequestInterval { client.fetchDefaultFriendTimelineListId() }
         val listId = resolved?.takeIf { it.isNotBlank() }
             ?: throw WeiboApiException(
-                "微博关注流请求缺少 list_id/fid：请填写登录账号 UID，或确认微博分组接口可返回“最新微博”分组。",
+                "微博关注流请求缺少 list_id/fid：PC 首页未识别当前账号 UID，且微博分组接口未返回“最新微博”分组。",
             )
         cachedFriendTimelineListId = listId
         return listId

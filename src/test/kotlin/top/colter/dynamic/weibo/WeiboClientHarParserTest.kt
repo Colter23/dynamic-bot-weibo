@@ -12,8 +12,6 @@ import java.net.URI
 import java.net.http.HttpClient
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
-import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -240,13 +238,6 @@ class WeiboClientHarParserTest {
     }
 
     @Test
-    fun `parse login state from har`() {
-        val response = harResponse("3.当前登录账号状态.har", "/ajax/getNavConfig") ?: return
-
-        assertTrue(client.parseLoginStateResponse(response))
-    }
-
-    @Test
     fun `parse current account from weibo home html`() {
         val response = harResponse("微博首页.har", "/") ?: return
 
@@ -259,27 +250,10 @@ class WeiboClientHarParserTest {
     }
 
     @Test
-    fun `parse current uid from mobile config`() {
-        val response = harResponse("移动端.har", "/api/config") ?: return
+    fun `home account requires user object`() {
+        val account = client.parseHomeAccountResponse("""<script>window.${'$'}CONFIG = {"uid":5977716744}</script>""")
 
-        assertEquals("5977716744", client.parseMobileConfigUidResponse(response))
-    }
-
-    @Test
-    fun `login state requires explicit ok`() {
-        assertFalse(client.parseLoginStateResponse("""{"data":{"uid":"5977716744"}}"""))
-        assertFalse(client.parseLoginStateResponse("""{"ok":0,"message":"未登录"}"""))
-    }
-
-    @Test
-    fun `classify login html response as login failure`() {
-        assertFailsWith<WeiboLoginException> {
-            client.parseHttpJsonResponse(
-                statusCode = 200,
-                path = "/ajax/getNavConfig",
-                body = "<html><title>微博登录</title><a href=\"https://passport.weibo.com/\">登录</a></html>",
-            )
-        }
+        assertEquals(null, account)
     }
 
     @Test
@@ -337,10 +311,11 @@ class WeiboClientHarParserTest {
     }
 
     @Test
-    fun `build friend timeline list id from login uid`() {
-        val client = WeiboClient(WeiboPublisherConfig(loginUserId = "5977716744"))
+    fun `build friend timeline list id from current account`() {
+        val response = harResponse("微博首页.har", "/") ?: return
+        val account = client.parseHomeAccountResponse(response)
 
-        assertEquals("110005977716744", client.configuredFriendTimelineListId())
+        assertEquals("110005977716744", client.friendTimelineListIdForAccount(account))
     }
 
     @Test

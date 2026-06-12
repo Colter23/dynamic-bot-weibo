@@ -15,7 +15,6 @@ public data class WeiboPublisherConfig(
     val followGroupName: String = "",
     val autoCreateFollowGroup: Boolean = false,
     val maxConsecutiveLoginFailures: Int = 3,
-    val loginUserId: String = "",
     val cookie: String = "",
 )
 
@@ -102,13 +101,6 @@ public object WeiboPublisherConfigForm {
                 description = "连续几次检测到未登录后暂停轮询。设为 0 表示不自动暂停；更新 Cookie 或登录恢复后会继续。",
                 min = 0,
                 numberKind = ConfigNumberKind.INTEGER,
-            ),
-            ConfigFieldSpec(
-                path = "loginUserId",
-                label = "登录账号 UID",
-                type = ConfigFieldType.TEXT,
-                section = "请求",
-                description = "当前登录微博账号 UID。优先使用关注流时用于构造 list_id/fid；留空时会尝试从微博分组接口获取默认关注流分组。",
             ),
             ConfigFieldSpec(
                 path = "cookie",

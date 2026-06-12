@@ -238,8 +238,7 @@ internal class WeiboPublisherRuntime() :
             previous.requestIntervalSeconds != next.requestIntervalSeconds ||
             previous.maxPollPages != next.maxPollPages ||
             previous.useFriendTimelinePolling != next.useFriendTimelinePolling ||
-            previous.cookie != next.cookie ||
-            previous.loginUserId != next.loginUserId
+            previous.cookie != next.cookie
 
         return ConfigApplyResult(
             changed = true,
