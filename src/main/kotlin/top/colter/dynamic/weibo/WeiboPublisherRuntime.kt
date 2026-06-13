@@ -17,7 +17,6 @@ import top.colter.dynamic.core.data.SourceCursor
 import top.colter.dynamic.core.data.SourceUpdate
 import top.colter.dynamic.core.data.SubscriptionEventKind
 import top.colter.dynamic.core.data.hasSeen
-import top.colter.dynamic.core.data.replayLowerBoundAtEpochSeconds
 import top.colter.dynamic.core.event.SourceUpdatePublishRequest
 import top.colter.dynamic.core.event.SourceUpdatePublisher
 import top.colter.dynamic.core.event.SystemNotificationPublisher
@@ -382,13 +381,10 @@ internal class WeiboPublisherRuntime() :
 
     private suspend fun detectAndPublishLocked() {
         loadActivePublishers(logSummary = false)
-        val startupBootstrapAttempted = runStartupBootstrapIfPending()
+        runStartupBootstrapIfPending()
         val publisherSnapshot = activePublishers
         if (publisherSnapshot.isEmpty()) {
             logger.debug { "微博检测跳过：没有活跃订阅发布者" }
-            return
-        }
-        if (startupBootstrapAttempted && config.useFriendTimelinePolling) {
             return
         }
 
@@ -406,9 +402,8 @@ internal class WeiboPublisherRuntime() :
         publisherSnapshot: Map<Int, Publisher>,
         now: Long,
     ) {
-        val lowerBound = pollingLowerBound(publisherSnapshot.values, now)
         val page = runWeiboRequest("微博关注流拉取") {
-            gateway.fetchFollowTimeline(lowerBound)
+            gateway.fetchFollowTimeline(null)
         }.getOrNull() ?: return
 
         val postsByUserId = page.posts
@@ -426,12 +421,15 @@ internal class WeiboPublisherRuntime() :
             }
         }
 
-        val uncoveredWithoutCursor = publisherSnapshot.values.count { publisher ->
-            cursorStore.get(publisher.id) == null && publisher.externalId !in postsByUserId
+        val uncoveredPublishers = publisherSnapshot.values.filter { publisher ->
+            publisher.externalId !in postsByUserId
         }
-        if (uncoveredWithoutCursor > 0) {
+        if (uncoveredPublishers.isNotEmpty()) {
             logger.debug {
-                "微博关注流未覆盖 $uncoveredWithoutCursor 个未初始化游标的订阅用户；本轮不初始化这些游标，等待关注流出现动态。"
+                "微博关注流未覆盖 ${uncoveredPublishers.size} 个订阅用户；将有限兜底拉取用户时间线。"
+            }
+            uncoveredPublishers.forEach { publisher ->
+                detectPublisher(publisher, now)
             }
         }
     }
@@ -763,18 +761,6 @@ internal class WeiboPublisherRuntime() :
             logger.debug { "微博检测任务已在运行：taskId=$detectTaskId" }
         }
         return started
-    }
-
-    private fun pollingLowerBound(
-        publishers: Collection<Publisher>,
-        now: Long,
-    ): Long? {
-        val cursors = publishers.mapNotNull { publisher -> cursorStore.get(publisher.id) }
-        if (cursors.isEmpty()) return null
-        return cursors.minOf { cursor ->
-            cursor.replayLowerBoundAtEpochSeconds(config.replayWindowMinutes, now)
-                ?: cursor.lastSeenAtEpochSeconds
-        }
     }
 
     private fun markSeenMonotonic(

@@ -99,10 +99,11 @@ class WeiboPublisherRuntimeTest {
         scheduler.runOnce("weibo-detect")
 
         assertEquals(listOf("missed-old"), updates.requests.map { it.update.key.externalId })
-        assertEquals(1, gateway.followTimelineSinceValues.size)
-        assertNotNull(gateway.followTimelineSinceValues.single())
-        assertTrue(gateway.followTimelineSinceValues.single()!! >= now - 10 * 60 - 2)
-        assertTrue(gateway.followTimelineSinceValues.single()!! <= now - 10 * 60 + 2)
+        assertEquals(2, gateway.followTimelineSinceValues.size)
+        assertNotNull(gateway.followTimelineSinceValues.first())
+        assertTrue(gateway.followTimelineSinceValues.first()!! >= now - 10 * 60 - 2)
+        assertTrue(gateway.followTimelineSinceValues.first()!! <= now - 10 * 60 + 2)
+        assertEquals(null as Long?, gateway.followTimelineSinceValues.last())
         assertEquals(0, gateway.userTimelineCalls)
         assertEquals("SUB=new; XSRF-TOKEN=fresh", savedConfig?.cookie)
         val cursor = cursorStore.get(publisher.id)
@@ -156,10 +157,11 @@ class WeiboPublisherRuntimeTest {
         assertEquals(listOf("candidate"), updates.requests.map { it.update.key.externalId })
         assertEquals(listOf("candidate"), gateway.enrichedPostIds)
         assertEquals(0, gateway.userTimelineCalls)
+        assertEquals(listOf<Long?>(null), gateway.followTimelineSinceValues.takeLast(1))
     }
 
     @Test
-    fun `replay window zero warms up current follow timeline without publishing`() = runBlocking {
+    fun `replay window zero warms up current follow timeline then continues detection`() = runBlocking {
         val now = System.currentTimeMillis() / 1000
         val publisher = testPublisher(id = 1, userId = "10001")
         val cursorStore = InMemoryWeiboCursorStore(
@@ -175,9 +177,18 @@ class WeiboPublisherRuntimeTest {
             )
         )
         val gateway = RecordingWeiboGateway(
-            posts = listOf(
-                testPost("newer", publisher.externalId, now - 3_600),
-                testPost("older", publisher.externalId, now - 3_700),
+            followTimelinePages = listOf(
+                WeiboTimelinePage(
+                    posts = listOf(
+                        testPost("warmup-newer", publisher.externalId, now - 3_600),
+                        testPost("warmup-older", publisher.externalId, now - 3_700),
+                    ),
+                ),
+                WeiboTimelinePage(
+                    posts = listOf(
+                        testPost("current-new", publisher.externalId, now - 60),
+                    ),
+                ),
             ),
         )
         val updates = RecordingSourceUpdatePublisher()
@@ -199,20 +210,121 @@ class WeiboPublisherRuntimeTest {
         runtime.onStart()
         scheduler.runOnce("weibo-detect")
 
-        assertEquals(emptyList(), updates.requests.map { it.update.key.externalId })
-        assertEquals(listOf<Long?>(null), gateway.followTimelineSinceValues)
+        assertEquals(listOf("current-new"), updates.requests.map { it.update.key.externalId })
+        assertEquals(listOf<Long?>(null, null), gateway.followTimelineSinceValues)
         assertEquals(0, gateway.userTimelineCalls)
         val warmed = cursorStore.get(publisher.id)
         assertNotNull(warmed)
-        assertTrue(warmed.recentUpdateKeys.contains("older"))
-        assertTrue(warmed.recentUpdateKeys.contains("newer"))
-        assertEquals(now - 3_600, warmed.lastSeenAtEpochSeconds)
+        assertTrue(warmed.recentUpdateKeys.contains("warmup-older"))
+        assertTrue(warmed.recentUpdateKeys.contains("warmup-newer"))
+        assertTrue(warmed.recentUpdateKeys.contains("current-new"))
+        assertEquals(now - 60, warmed.lastSeenAtEpochSeconds)
+    }
 
+    @Test
+    fun `friend timeline falls back to user timeline for uncovered publisher without cursor`() = runBlocking {
+        val now = System.currentTimeMillis() / 1000
+        val covered = testPublisher(id = 1, userId = "10001")
+        val uncovered = testPublisher(id = 2, userId = "20002")
+        val cursorStore = InMemoryWeiboCursorStore(
+            initial = mapOf(
+                covered.id to SourceCursor(
+                    publisherId = covered.id,
+                    sourceKey = WEIBO_DYNAMIC_FEED_KEY,
+                    eventType = SourceEventType.DYNAMIC_CREATED,
+                    lastSeenUpdateKey = "covered-seen",
+                    lastSeenAtEpochSeconds = now - 600,
+                    recentUpdateKeys = listOf("covered-seen"),
+                )
+            )
+        )
+        val gateway = RecordingWeiboGateway(
+            posts = listOf(testPost("covered-new", covered.externalId, now - 60)),
+            userTimelinePosts = mapOf(
+                uncovered.externalId to listOf(testPost("uncovered-new", uncovered.externalId, now - 30)),
+            ),
+        )
+        val updates = RecordingSourceUpdatePublisher()
+        val scheduler = ManualTaskScheduler()
+        val runtime = WeiboPublisherRuntime(
+            loadConfig = {
+                WeiboPublisherConfig(
+                    pollingEnabled = true,
+                    useFriendTimelinePolling = true,
+                    replayWindowMinutes = 0,
+                )
+            },
+            gatewayFactory = { gateway },
+            cursorStoreFactory = { cursorStore },
+            taskScheduler = scheduler,
+        )
+        runtime.onLoad(testContext(updates, FixedSubscriptionQueryService(listOf(covered, uncovered))))
+
+        runtime.onStart()
         scheduler.runOnce("weibo-detect")
 
         assertEquals(emptyList(), updates.requests.map { it.update.key.externalId })
-        assertEquals(2, gateway.followTimelineSinceValues.size)
-        assertEquals(now - 3_600, gateway.followTimelineSinceValues.last())
+        assertEquals(1, gateway.userTimelineCalls)
+        assertEquals(listOf(uncovered.externalId), gateway.userTimelineUserIds)
+        val uncoveredCursor = cursorStore.get(uncovered.id)
+        assertNotNull(uncoveredCursor)
+        assertTrue(uncoveredCursor.recentUpdateKeys.contains("uncovered-new"))
+    }
+
+    @Test
+    fun `friend timeline falls back to user timeline for uncovered publisher with cursor`() = runBlocking {
+        val now = System.currentTimeMillis() / 1000
+        val covered = testPublisher(id = 1, userId = "10001")
+        val uncovered = testPublisher(id = 2, userId = "20002")
+        val cursorStore = InMemoryWeiboCursorStore(
+            initial = mapOf(
+                covered.id to SourceCursor(
+                    publisherId = covered.id,
+                    sourceKey = WEIBO_DYNAMIC_FEED_KEY,
+                    eventType = SourceEventType.DYNAMIC_CREATED,
+                    lastSeenUpdateKey = "covered-seen",
+                    lastSeenAtEpochSeconds = now - 600,
+                    recentUpdateKeys = listOf("covered-seen"),
+                ),
+                uncovered.id to SourceCursor(
+                    publisherId = uncovered.id,
+                    sourceKey = WEIBO_DYNAMIC_FEED_KEY,
+                    eventType = SourceEventType.DYNAMIC_CREATED,
+                    lastSeenUpdateKey = "uncovered-seen",
+                    lastSeenAtEpochSeconds = now - 600,
+                    recentUpdateKeys = listOf("uncovered-seen"),
+                ),
+            )
+        )
+        val gateway = RecordingWeiboGateway(
+            posts = listOf(testPost("covered-new", covered.externalId, now - 60)),
+            userTimelinePosts = mapOf(
+                uncovered.externalId to listOf(testPost("uncovered-new", uncovered.externalId, now - 30)),
+            ),
+        )
+        val updates = RecordingSourceUpdatePublisher()
+        val scheduler = ManualTaskScheduler()
+        val runtime = WeiboPublisherRuntime(
+            loadConfig = {
+                WeiboPublisherConfig(
+                    pollingEnabled = true,
+                    useFriendTimelinePolling = true,
+                    replayWindowMinutes = 0,
+                )
+            },
+            gatewayFactory = { gateway },
+            cursorStoreFactory = { cursorStore },
+            taskScheduler = scheduler,
+        )
+        runtime.onLoad(testContext(updates, FixedSubscriptionQueryService(listOf(covered, uncovered))))
+
+        runtime.onStart()
+        scheduler.runOnce("weibo-detect")
+
+        assertEquals(listOf("uncovered-new"), updates.requests.map { it.update.key.externalId })
+        assertEquals(1, gateway.userTimelineCalls)
+        assertEquals(listOf(uncovered.externalId), gateway.userTimelineUserIds)
+        assertTrue(cursorStore.get(uncovered.id)?.recentUpdateKeys?.contains("uncovered-new") == true)
     }
 
     @Test
@@ -427,10 +539,13 @@ class WeiboPublisherRuntimeTest {
 
     private class RecordingWeiboGateway(
         private val posts: List<WeiboPostSnapshot> = emptyList(),
+        private val followTimelinePages: List<WeiboTimelinePage> = emptyList(),
+        private val userTimelinePosts: Map<String, List<WeiboPostSnapshot>> = emptyMap(),
         private val exportedCookie: String = "",
     ) : WeiboGateway {
         val followTimelineSinceValues: MutableList<Long?> = mutableListOf()
         val enrichedPostIds: MutableList<String> = mutableListOf()
+        val userTimelineUserIds: MutableList<String> = mutableListOf()
         var userTimelineCalls: Int = 0
 
         override fun exportCookie(): String = exportedCookie
@@ -446,12 +561,14 @@ class WeiboPublisherRuntimeTest {
             sinceEpochSeconds: Long?,
         ): WeiboTimelinePage {
             userTimelineCalls += 1
-            return WeiboTimelinePage()
+            userTimelineUserIds += userId
+            return WeiboTimelinePage(posts = userTimelinePosts[userId].orEmpty())
         }
 
         override suspend fun fetchFollowTimeline(sinceEpochSeconds: Long?): WeiboTimelinePage {
             followTimelineSinceValues += sinceEpochSeconds
-            return WeiboTimelinePage(posts = posts)
+            return followTimelinePages.getOrNull(followTimelineSinceValues.lastIndex)
+                ?: WeiboTimelinePage(posts = posts)
         }
 
         override suspend fun enrichPost(post: WeiboPostSnapshot): WeiboPostSnapshot {

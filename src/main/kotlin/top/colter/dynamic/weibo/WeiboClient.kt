@@ -1256,7 +1256,7 @@ internal class WeiboHttpGateway(
             if (page.posts.isEmpty()) break
 
             posts += page.posts
-            if (sinceEpochSeconds == null) {
+            if (sinceEpochSeconds == null || pageNumber >= maxPollPages.coerceAtLeast(1)) {
                 nextCursor = page.nextCursor
                 break
             }
