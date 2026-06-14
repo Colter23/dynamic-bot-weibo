@@ -94,11 +94,6 @@ class WeiboLinkResolverTest {
     ) : WeiboGateway {
         override suspend fun fetchPublisherSnapshot(userId: String): WeiboPublisherSnapshot? = null
 
-        override suspend fun fetchUserTimeline(
-            userId: String,
-            sinceEpochSeconds: Long?,
-        ): WeiboTimelinePage = WeiboTimelinePage()
-
         override suspend fun fetchPostDetail(postId: String): WeiboPostSnapshot? {
             return post?.takeIf { it.postId == postId }
         }

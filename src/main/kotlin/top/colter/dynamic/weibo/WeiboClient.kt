@@ -151,26 +151,6 @@ internal class WeiboClient(
         )
     }
 
-    suspend fun fetchUserTimeline(
-        userId: String,
-        page: Int = 1,
-        feature: Int = 0,
-        sinceId: String? = null,
-    ): WeiboTimelinePage {
-        return parseUserTimelineResponse(
-            getJson(
-                path = "/ajax/statuses/mymblog",
-                parameters = buildList {
-                    add("uid" to userId)
-                    add("page" to page.toString())
-                    add("feature" to feature.toString())
-                    sinceId?.takeIf(String::isNotBlank)?.let { add("since_id" to it) }
-                },
-                referer = "$WEIBO_HOME/u/$userId",
-            )
-        )
-    }
-
     internal fun parseUserTimelineResponse(json: String): WeiboTimelinePage {
         return parseUserTimelineResponse(WEIBO_JSON.parseToJsonElement(json))
     }
@@ -1189,7 +1169,6 @@ internal class WeiboClient(
 
 internal class WeiboHttpGateway(
     private val client: WeiboClient,
-    private val maxPollPages: Int,
     private val requestIntervalMs: Long,
     private val followGroupName: String = "",
     private val autoCreateFollowGroup: Boolean = false,
@@ -1212,41 +1191,21 @@ internal class WeiboHttpGateway(
         }
     }
 
-    override suspend fun fetchUserTimeline(
-        userId: String,
-        sinceEpochSeconds: Long?,
-    ): WeiboTimelinePage {
-        val posts = mutableListOf<WeiboPostSnapshot>()
-        var nextCursor: String? = null
-        var pageNumber = 1
-        while (pageNumber <= maxPollPages.coerceAtLeast(1)) {
-            val page = withRequestInterval {
-                client.fetchUserTimeline(
-                    userId = userId,
-                    page = pageNumber,
-                    sinceId = nextCursor,
-                )
-            }
-            if (page.posts.isEmpty()) break
-            posts += page.posts
-            nextCursor = page.nextCursor
-            if (sinceEpochSeconds == null) break
-            if (page.posts.minOf { it.createdAtEpochSeconds } < sinceEpochSeconds) break
-            if (nextCursor.isNullOrBlank()) break
-            pageNumber += 1
-        }
-        return WeiboTimelinePage(
-            posts = posts.distinctBy { it.postId },
-            nextCursor = nextCursor,
-        )
-    }
-
     override suspend fun fetchFollowTimeline(sinceEpochSeconds: Long?): WeiboTimelinePage {
         val listId = resolveFriendTimelineListId()
+        if (sinceEpochSeconds == null) {
+            return withRequestInterval {
+                client.fetchFriendTimeline(
+                    listId = listId,
+                    sinceId = "0",
+                )
+            }
+        }
+
         val posts = mutableListOf<WeiboPostSnapshot>()
         var nextCursor: String? = "0"
         var pageNumber = 1
-        while (pageNumber <= maxPollPages.coerceAtLeast(1)) {
+        while (pageNumber <= HISTORY_REPLAY_MAX_PAGES) {
             val page = withRequestInterval {
                 client.fetchFriendTimeline(
                     listId = listId,
@@ -1256,16 +1215,8 @@ internal class WeiboHttpGateway(
             if (page.posts.isEmpty()) break
 
             posts += page.posts
-            if (sinceEpochSeconds == null || pageNumber >= maxPollPages.coerceAtLeast(1)) {
-                nextCursor = page.nextCursor
-                break
-            }
-            if (page.posts.minOf { it.createdAtEpochSeconds } < sinceEpochSeconds) {
-                nextCursor = page.nextCursor
-                break
-            }
-
             nextCursor = page.nextCursor
+            if (page.posts.minOf { it.createdAtEpochSeconds } < sinceEpochSeconds) break
             if (nextCursor.isNullOrBlank()) break
             pageNumber += 1
         }
@@ -1494,6 +1445,10 @@ internal class WeiboHttpGateway(
                 delay(requestIntervalMs)
             }
         }
+    }
+
+    private companion object {
+        private const val HISTORY_REPLAY_MAX_PAGES: Int = 3
     }
 }
 

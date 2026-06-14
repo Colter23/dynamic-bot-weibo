@@ -127,11 +127,6 @@ internal interface WeiboGateway {
 
     suspend fun fetchPublisherSnapshot(userId: String): WeiboPublisherSnapshot?
 
-    suspend fun fetchUserTimeline(
-        userId: String,
-        sinceEpochSeconds: Long? = null,
-    ): WeiboTimelinePage
-
     suspend fun fetchFollowTimeline(
         sinceEpochSeconds: Long? = null,
     ): WeiboTimelinePage {
@@ -187,11 +182,6 @@ internal interface WeiboGateway {
 
 internal class UnsupportedWeiboGateway : WeiboGateway {
     override suspend fun fetchPublisherSnapshot(userId: String): WeiboPublisherSnapshot? = null
-
-    override suspend fun fetchUserTimeline(
-        userId: String,
-        sinceEpochSeconds: Long?,
-    ): WeiboTimelinePage = WeiboTimelinePage()
 
     override suspend fun fetchPostDetail(postId: String): WeiboPostSnapshot? = null
 }

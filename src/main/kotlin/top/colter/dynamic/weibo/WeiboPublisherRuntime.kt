@@ -78,7 +78,6 @@ internal class WeiboPublisherRuntime() :
     private var gatewayFactory: (WeiboPublisherConfig) -> WeiboGateway = { config ->
         WeiboHttpGateway(
             client = WeiboClient(config),
-            maxPollPages = config.maxPollPages,
             requestIntervalMs = secondsToMillis(config.requestIntervalSeconds, minimumMillis = 0),
             followGroupName = config.followGroupName,
             autoCreateFollowGroup = config.autoCreateFollowGroup,
@@ -235,8 +234,6 @@ internal class WeiboPublisherRuntime() :
         val restartRequired = previous.pollingEnabled != next.pollingEnabled ||
             previous.pollingIntervalSeconds != next.pollingIntervalSeconds ||
             previous.requestIntervalSeconds != next.requestIntervalSeconds ||
-            previous.maxPollPages != next.maxPollPages ||
-            previous.useFriendTimelinePolling != next.useFriendTimelinePolling ||
             previous.cookie != next.cookie
 
         return ConfigApplyResult(
@@ -389,13 +386,7 @@ internal class WeiboPublisherRuntime() :
         }
 
         val now = System.currentTimeMillis() / 1000
-        if (config.useFriendTimelinePolling) {
-            detectByFriendTimeline(publisherSnapshot, now)
-            return
-        }
-        publisherSnapshot.values.forEach { publisher ->
-            detectPublisher(publisher, now)
-        }
+        detectByFriendTimeline(publisherSnapshot, now)
     }
 
     private suspend fun detectByFriendTimeline(
@@ -420,35 +411,28 @@ internal class WeiboPublisherRuntime() :
                 )
             }
         }
-
-        val uncoveredPublishers = publisherSnapshot.values.filter { publisher ->
-            publisher.externalId !in postsByUserId
-        }
-        if (uncoveredPublishers.isNotEmpty()) {
-            logger.debug {
-                "微博关注流未覆盖 ${uncoveredPublishers.size} 个订阅用户；将有限兜底拉取用户时间线。"
-            }
-            uncoveredPublishers.forEach { publisher ->
-                detectPublisher(publisher, now)
-            }
-        }
+        initializeUncoveredPublisherCursors(
+            publishers = publisherSnapshot.values,
+            coveredUserIds = postsByUserId.keys,
+            now = now,
+        )
     }
 
-    private suspend fun detectPublisher(publisher: Publisher, now: Long) {
-        val initialCursor = cursorStore.get(publisher.id)
-        val page = runWeiboRequest("微博动态拉取 uid=${publisher.externalId}") {
-            gateway.fetchUserTimeline(
-                userId = publisher.externalId,
-                sinceEpochSeconds = initialCursor?.lastSeenAtEpochSeconds,
-            )
-        }.getOrNull() ?: return
-
-        detectPublisherPosts(
-            publisher = publisher,
-            rawPosts = page.posts,
-            now = now,
-            initializeCursorWhenEmpty = true,
-        )
+    private fun initializeUncoveredPublisherCursors(
+        publishers: Collection<Publisher>,
+        coveredUserIds: Set<String>,
+        now: Long,
+    ) {
+        var initializedCount = 0
+        publishers.forEach { publisher ->
+            if (publisher.externalId in coveredUserIds) return@forEach
+            if (cursorStore.get(publisher.id) != null) return@forEach
+            cursorStore.ensureBaseline(publisher.id, now)
+            initializedCount += 1
+        }
+        if (initializedCount > 0) {
+            logger.debug { "微博关注流未覆盖发布者已初始化游标：发布者=$initializedCount" }
+        }
     }
 
     private suspend fun detectPublisherPosts(
@@ -512,7 +496,6 @@ internal class WeiboPublisherRuntime() :
     }
 
     private fun scheduleStartupBootstrap(allowReplay: Boolean) {
-        if (!config.useFriendTimelinePolling) return
         synchronized(startupBootstrapLock) {
             if (config.replayWindowMinutes > 0 && allowReplay) {
                 startupReplayPending = true
@@ -538,7 +521,6 @@ internal class WeiboPublisherRuntime() :
     private suspend fun runStartupBootstrapIfPending(): Boolean {
         val plan = takeStartupBootstrapPlan()
         if (!plan.hasWork) return false
-        if (!config.useFriendTimelinePolling) return false
 
         if (plan.replayMissingFollowTimeline) {
             runCatching { replayMissingFollowTimeline() }
