@@ -2,7 +2,7 @@ id: weibo-publisher
 name: 微博动态源插件
 version: 0.0.1
 mainClass: top.colter.dynamic.weibo.WeiboPublisherPlugin
-apiVersion: 4.0.0
+apiVersion: 1.0.0
 description: 微博动态轮询、发布者资料查询、关注分组与订阅分发插件。
 author: dynamic-bot
 drawAssets:
