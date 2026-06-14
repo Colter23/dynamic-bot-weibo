@@ -1,5 +1,6 @@
 package top.colter.dynamic.weibo
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import top.colter.dynamic.core.config.ConfigApplyResult
 import top.colter.dynamic.core.config.ConfigurablePlugin
@@ -191,6 +192,7 @@ internal class WeiboPublisherRuntime() :
             }
             return
         }
+        requestFailureHandler.recordSuccess("微博启动登录状态检查")
         val taskStarted = bootstrapLoggedInState(allowReplay = true)
         logger.info {
             "微博轮询已就绪：账号=${loginResult.account?.name ?: loginResult.account?.userId ?: "未知"}，任务新启动=$taskStarted"
@@ -294,8 +296,15 @@ internal class WeiboPublisherRuntime() :
     }
 
     override suspend fun checkLoginState(): PublisherLoginResult {
-        val result = requestFailureHandler.runLoginCheck {
+        val result = try {
             gateway.checkLoginState()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            PublisherLoginResult(
+                status = PublisherLoginStatus.FAILED,
+                message = error.message ?: "微博登录状态检查失败",
+            )
         }
         if (result.status == PublisherLoginStatus.SUCCESS) {
             persistRuntimeCookieIfChanged()
@@ -326,6 +335,7 @@ internal class WeiboPublisherRuntime() :
         gateway = gatewayFactory(next)
         val result = checkLoginState()
         if (result.status == PublisherLoginStatus.SUCCESS) {
+            requestFailureHandler.recordSuccess("Cookie 登录")
             if (!persistRuntimeCookieIfChanged()) {
                 saveConfig(pluginId, config)
             }

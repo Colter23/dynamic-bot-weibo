@@ -5,8 +5,6 @@ import top.colter.dynamic.core.event.NoopSystemNotificationPublisher
 import top.colter.dynamic.core.event.SystemNotificationPublishRequest
 import top.colter.dynamic.core.event.SystemNotificationPublisher
 import top.colter.dynamic.core.event.SystemNotificationSeverity
-import top.colter.dynamic.core.plugin.PublisherLoginResult
-import top.colter.dynamic.core.plugin.PublisherLoginStatus
 import top.colter.dynamic.core.tools.loggerFor
 
 private val requestFailureLogger = loggerFor<WeiboRequestFailureHandler>()
@@ -41,28 +39,6 @@ internal class WeiboRequestFailureHandler(
         } catch (error: Throwable) {
             recordFailure(operation, error)
             Result.failure(error)
-        }
-    }
-
-    suspend fun runLoginCheck(block: suspend () -> PublisherLoginResult): PublisherLoginResult {
-        return try {
-            val result = block()
-            if (result.status == PublisherLoginStatus.SUCCESS) {
-                recordSuccess("微博登录状态检查")
-            } else {
-                recordLoginFailure(
-                    operation = "微博登录状态检查",
-                    message = result.message,
-                    cause = null,
-                )
-            }
-            result
-        } catch (error: Throwable) {
-            recordFailure("微博登录状态检查", error)
-            PublisherLoginResult(
-                status = PublisherLoginStatus.FAILED,
-                message = error.message ?: "微博登录状态检查失败",
-            )
         }
     }
 

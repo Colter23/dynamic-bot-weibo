@@ -30,6 +30,9 @@ import top.colter.dynamic.core.event.SubscriptionChangeType
 import top.colter.dynamic.core.event.SourceUpdatePublishRequest
 import top.colter.dynamic.core.event.SourceUpdatePublishResult
 import top.colter.dynamic.core.event.SourceUpdatePublisher
+import top.colter.dynamic.core.event.SystemNotificationPublishRequest
+import top.colter.dynamic.core.event.SystemNotificationPublishResult
+import top.colter.dynamic.core.event.SystemNotificationPublisher
 import top.colter.dynamic.core.plugin.PluginContext
 import top.colter.dynamic.core.plugin.PluginDescriptor
 import top.colter.dynamic.core.plugin.SourceStateStore
@@ -49,6 +52,49 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 class WeiboPublisherRuntimeTest {
+    @Test
+    fun `startup login check failure does not pause polling or notify administrators`() = runBlocking {
+        val gateway = RecordingWeiboGateway(
+            loginResult = PublisherLoginResult(
+                status = PublisherLoginStatus.FAILED,
+                message = "Cookie 已失效",
+            ),
+        )
+        val scheduler = ManualTaskScheduler()
+        val notifications = mutableListOf<SystemNotificationPublishRequest>()
+        val runtime = WeiboPublisherRuntime(
+            loadConfig = {
+                WeiboPublisherConfig(
+                    pollingEnabled = true,
+                    maxConsecutiveLoginFailures = 1,
+                    cookie = "SUB=expired",
+                )
+            },
+            gatewayFactory = { gateway },
+            cursorStoreFactory = { InMemoryWeiboCursorStore() },
+            taskScheduler = scheduler,
+        )
+        runtime.onLoad(
+            testContext(
+                updates = RecordingSourceUpdatePublisher(),
+                subscriptions = FixedSubscriptionQueryService(emptyList()),
+                notificationPublisher = SystemNotificationPublisher { request ->
+                    notifications += request
+                    SystemNotificationPublishResult.accepted()
+                },
+            )
+        )
+
+        runtime.onStart()
+        repeat(3) {
+            runtime.checkLoginState()
+        }
+
+        assertFalse(scheduler.isRunning("weibo-detect"))
+        assertEquals(4, gateway.loginCheckCount)
+        assertEquals(emptyList(), notifications)
+    }
+
     @Test
     fun `startup replay uses friend timeline and persists runtime cookie`() = runBlocking {
         val now = System.currentTimeMillis() / 1000
@@ -431,6 +477,9 @@ class WeiboPublisherRuntimeTest {
     private fun testContext(
         updates: SourceUpdatePublisher,
         subscriptions: SubscriptionQueryService,
+        notificationPublisher: SystemNotificationPublisher = SystemNotificationPublisher {
+            SystemNotificationPublishResult.accepted()
+        },
     ): PluginContext {
         return PluginContext(
             pluginId = "weibo-publisher",
@@ -448,6 +497,7 @@ class WeiboPublisherRuntimeTest {
             sourceUpdatePublisher = updates,
             sourceStateStore = DummySourceStateStore,
             subscriptionQueryService = subscriptions,
+            notificationPublisher = notificationPublisher,
         )
     }
 
@@ -512,14 +562,18 @@ class WeiboPublisherRuntimeTest {
         private val posts: List<WeiboPostSnapshot> = emptyList(),
         private val followTimelinePages: List<WeiboTimelinePage> = emptyList(),
         private val exportedCookie: String = "",
+        private val loginResult: PublisherLoginResult = PublisherLoginResult(PublisherLoginStatus.SUCCESS, "登录成功"),
     ) : WeiboGateway {
         val followTimelineSinceValues: MutableList<Long?> = mutableListOf()
         val enrichedPostIds: MutableList<String> = mutableListOf()
+        var loginCheckCount: Int = 0
+            private set
 
         override fun exportCookie(): String = exportedCookie
 
         override suspend fun checkLoginState(): PublisherLoginResult {
-            return PublisherLoginResult(PublisherLoginStatus.SUCCESS, "登录成功")
+            loginCheckCount += 1
+            return loginResult
         }
 
         override suspend fun fetchPublisherSnapshot(userId: String): WeiboPublisherSnapshot? = null

@@ -4,8 +4,6 @@ import kotlinx.coroutines.runBlocking
 import top.colter.dynamic.core.event.SystemNotificationPublishRequest
 import top.colter.dynamic.core.event.SystemNotificationPublishResult
 import top.colter.dynamic.core.event.SystemNotificationPublisher
-import top.colter.dynamic.core.plugin.PublisherLoginResult
-import top.colter.dynamic.core.plugin.PublisherLoginStatus
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -23,21 +21,21 @@ class WeiboRequestFailureHandlerTest {
             },
         )
 
-        handler.runLoginCheck {
-            PublisherLoginResult(PublisherLoginStatus.FAILED, "Cookie 已失效")
+        handler.run("微博关注流拉取") {
+            throw WeiboLoginException("Cookie 已失效")
         }
 
         assertFalse(handler.isPollingPaused())
 
-        handler.runLoginCheck {
-            PublisherLoginResult(PublisherLoginStatus.FAILED, "Cookie 已失效")
+        handler.run("微博关注流拉取") {
+            throw WeiboLoginException("Cookie 已失效")
         }
 
         assertTrue(handler.isPollingPaused())
         assertEquals("weibo.login_paused", notifications.single().type)
 
-        handler.runLoginCheck {
-            PublisherLoginResult(PublisherLoginStatus.SUCCESS, "微博登录状态可用")
+        handler.run("微博关注流拉取") {
+            "ok"
         }
 
         assertFalse(handler.isPollingPaused())
