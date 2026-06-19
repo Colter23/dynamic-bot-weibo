@@ -4,7 +4,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.runBlocking
-import top.colter.dynamic.core.command.CommandPublisher
 import top.colter.dynamic.core.config.ConfigMigration
 import top.colter.dynamic.core.config.ConfigService
 import top.colter.dynamic.core.config.PluginDataStore
@@ -493,7 +492,6 @@ class WeiboPublisherRuntimeTest {
             dataStore = DummyPluginDataStore,
             scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
             taskScheduler = ManualTaskScheduler(),
-            commandPublisher = CommandPublisher { },
             sourceUpdatePublisher = updates,
             sourceStateStore = DummySourceStateStore,
             subscriptionQueryService = subscriptions,
