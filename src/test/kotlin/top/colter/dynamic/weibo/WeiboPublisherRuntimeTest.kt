@@ -19,6 +19,7 @@ import top.colter.dynamic.core.data.PublisherSubscribers
 import top.colter.dynamic.core.data.SourceCursor
 import top.colter.dynamic.core.data.SourceEventType
 import top.colter.dynamic.core.data.Subscriber
+import top.colter.dynamic.core.data.SubscriberState
 import top.colter.dynamic.core.data.Subscription
 import top.colter.dynamic.core.data.SubscriptionPolicy
 import top.colter.dynamic.core.data.SubscriptionSubscriber
@@ -515,7 +516,7 @@ class WeiboPublisherRuntimeTest {
             id = id,
             address = TargetAddress.of("onebot", TargetKind.GROUP, "1000"),
             name = "测试群",
-            state = EntityState.ACTIVE,
+            state = SubscriberState.ACTIVE,
             createTime = 1,
             createUser = 1,
         )
@@ -642,7 +643,7 @@ class WeiboPublisherRuntimeTest {
                 id = index + 1,
                 address = TargetAddress.of("onebot", TargetKind.GROUP, "1000"),
                 name = "测试群",
-                state = EntityState.ACTIVE,
+                state = SubscriberState.ACTIVE,
                 createTime = 1,
                 createUser = 1,
             )

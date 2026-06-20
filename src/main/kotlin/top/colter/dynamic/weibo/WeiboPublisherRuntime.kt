@@ -809,7 +809,7 @@ internal class WeiboPublisherRuntime() :
     private fun PublisherSubscribers.hasDynamicEventSubscription(): Boolean {
         return subscriptions.any { item ->
             item.subscription.state == EntityState.ACTIVE &&
-                item.subscriber.state == EntityState.ACTIVE &&
+                item.subscriber.state.allowsActiveDelivery &&
                 SubscriptionEventKind.DYNAMIC in item.subscription.policy.enabledEvents
         }
     }
