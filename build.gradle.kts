@@ -5,7 +5,7 @@ plugins {
 apply(from = "gradle/dynamic-plugin-fatjar.gradle.kts")
 
 group = "top.colter.dynamic"
-version = "0.0.1"
+version = "0.0.2"
 
 repositories {
     mavenLocal()
@@ -14,7 +14,7 @@ repositories {
 
 dependencies {
     val coroutinesVersion = "1.11.0"
-    val coreVersion = "0.0.1"
+    val coreVersion = "0.0.2"
     val kotlinLoggingVersion = "8.0.4"
     val serializationVersion = "1.11.0"
 
