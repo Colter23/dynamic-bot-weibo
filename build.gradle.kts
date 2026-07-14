@@ -14,7 +14,7 @@ repositories {
 
 dependencies {
     val coroutinesVersion = "1.11.0"
-    val coreVersion = "0.0.2"
+    val coreVersion = "0.0.4"
     val kotlinLoggingVersion = "8.0.4"
     val serializationVersion = "1.11.0"
 
