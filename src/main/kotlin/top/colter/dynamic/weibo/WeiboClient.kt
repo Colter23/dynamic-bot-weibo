@@ -17,6 +17,8 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.longOrNull
 import top.colter.dynamic.core.data.MediaKind
 import top.colter.dynamic.core.data.MediaRef
+import top.colter.dynamic.core.link.LinkVideoDownloadRequest
+import top.colter.dynamic.core.link.LinkVideoDownloadResult
 import top.colter.dynamic.core.plugin.FollowActionResult
 import top.colter.dynamic.core.plugin.FollowActionStatus
 import top.colter.dynamic.core.plugin.FollowState
@@ -66,6 +68,7 @@ internal class WeiboClient(
     private val httpClient: HttpClient = defaultHttpClient(config.cookie),
 ) {
     private var cachedLoginAccount: PublisherLoginAccount? = null
+    private val videoDownloader = WeiboVideoDownloader(httpClient, DESKTOP_USER_AGENT)
 
     suspend fun checkLoginState(): PublisherLoginResult {
         val hasCookie = currentCookieHeader().isNotBlank()
@@ -337,6 +340,19 @@ internal class WeiboClient(
                 ),
                 referer = "$WEIBO_HOME/detail/$postId",
             )
+        )
+    }
+
+    suspend fun downloadVideoLink(request: LinkVideoDownloadRequest): LinkVideoDownloadResult {
+        val postId = request.parsedLink.targetId.trim()
+        require(postId.isNotBlank()) { "微博动态 ID 不能为空" }
+        val post = fetchPostDetail(postId) ?: error("未找到微博视频动态：$postId")
+        val video = post.findDownloadableVideo()
+            ?: error("微博动态未提供可下载的视频地址：$postId")
+        return videoDownloader.download(
+            request = request,
+            video = video,
+            referer = "$WEIBO_HOME/detail/$postId",
         )
     }
 
@@ -1240,6 +1256,7 @@ internal class WeiboClient(
             media?.string("h5_url"),
             media?.string("jump_to"),
         )
+        val videoSources = media?.videoSources().orEmpty()
         return WeiboMediaCardSnapshot(
             kind = kind,
             id = string("object_id") ?: string("page_id") ?: media?.string("media_id"),
@@ -1260,15 +1277,8 @@ internal class WeiboClient(
                 else -> null
             }?.toPlainWeiboText(),
             coverUrl = coverUrl,
-            mediaUrl = firstHttpUrl(
-                media?.bestPlaybackUrl(),
-                media?.string("mp4_1080p_mp4"),
-                media?.string("mp4_720p_mp4"),
-                media?.string("stream_url_hd"),
-                media?.string("stream_url"),
-                media?.string("mp4_hd_url"),
-                media?.string("mp4_sd_url"),
-            ),
+            mediaUrl = videoSources.bestVideoUrl(),
+            videoSources = videoSources,
             durationSeconds = media?.long("duration"),
             url = url,
         )
@@ -1317,17 +1327,29 @@ internal class WeiboClient(
             obj("card_info")?.obj("vote_object") != null
     }
 
-    private fun JsonObject.bestPlaybackUrl(): String? {
-        return array("playback_list")
-            .mapNotNull { item ->
-                val root = item.asObject() ?: return@mapNotNull null
+    private fun JsonObject.videoSources(): List<WeiboVideoSourceSnapshot> {
+        return buildList {
+            array("playback_list").forEach { item ->
+                val root = item.asObject() ?: return@forEach
                 val meta = root.obj("meta")
-                val playInfo = root.obj("play_info") ?: return@mapNotNull null
-                val url = playInfo.string("url") ?: return@mapNotNull null
-                (meta?.long("quality_index") ?: 0L) to url
+                val url = root.obj("play_info")?.string("url") ?: return@forEach
+                addVideoSource(meta?.long("quality_index")?.toInt() ?: 0, url)
             }
-            .maxByOrNull { it.first }
-            ?.second
+            addVideoSource(1080, string("mp4_1080p_mp4"))
+            addVideoSource(720, string("mp4_720p_mp4"))
+            addVideoSource(720, string("stream_url_hd"))
+            addVideoSource(480, string("stream_url"))
+            addVideoSource(720, string("mp4_hd_url"))
+            addVideoSource(480, string("mp4_sd_url"))
+        }.distinctBy { it.url }
+    }
+
+    private fun MutableList<WeiboVideoSourceSnapshot>.addVideoSource(quality: Int, url: String?) {
+        url?.takeIf { it.isHttpUrl() }?.let { add(WeiboVideoSourceSnapshot(quality, it)) }
+    }
+
+    private fun List<WeiboVideoSourceSnapshot>.bestVideoUrl(): String? {
+        return maxWithOrNull(compareBy<WeiboVideoSourceSnapshot> { it.quality }.thenBy { it.url })?.url
     }
 
     private fun JsonObject.bestPictureUrl(): String? {
@@ -1833,6 +1855,12 @@ internal class WeiboHttpGateway(
     override suspend fun fetchPostDetail(postId: String): WeiboPostSnapshot? {
         return withRequestInterval {
             client.fetchPostDetail(postId)?.enrichLongText()
+        }
+    }
+
+    override suspend fun downloadVideoLink(request: LinkVideoDownloadRequest): LinkVideoDownloadResult {
+        return withRequestInterval {
+            client.downloadVideoLink(request)
         }
     }
 

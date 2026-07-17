@@ -2,6 +2,7 @@ package top.colter.dynamic.weibo
 
 import top.colter.dynamic.core.data.MediaKind
 import top.colter.dynamic.core.data.MediaRef
+import top.colter.dynamic.core.data.DynamicMetric
 import top.colter.dynamic.core.data.PlatformId
 import top.colter.dynamic.core.data.Publisher
 import top.colter.dynamic.core.data.PublisherInfo
@@ -60,6 +61,13 @@ internal class WeiboLinkResolver(
             )
         } ?: return LinkResolution.Failed(parsedLink, "未找到微博动态：${parsedLink.targetId}")
 
+        source.findDownloadableVideo()?.let { video ->
+            return LinkResolution.Preview(
+                parsedLink = parsedLink,
+                preview = source.toVideoPreview(video),
+            )
+        }
+
         val update = mapper.map(source, fallbackPublisher())
             ?: return LinkResolution.Failed(parsedLink, "微博动态映射失败：${parsedLink.targetId}")
 
@@ -90,6 +98,36 @@ internal class WeiboLinkResolver(
                 cover = publisher.banner,
                 publisher = publisher,
             ),
+        )
+    }
+
+    private fun WeiboPostSnapshot.toVideoPreview(video: WeiboMediaCardSnapshot): LinkPreview {
+        val userId = userId.takeIf { it.isNotBlank() }
+        val publisher = userId?.let {
+            PublisherInfo(
+                key = PublisherKey.of(platformId.value, PublisherKind.USER, it),
+                name = screenName?.takeIf { name -> name.isNotBlank() } ?: "微博用户 $it",
+                avatar = MediaRef(avatarUrl?.takeIf { url -> url.isNotBlank() } ?: DEFAULT_WEIBO_AVATAR, MediaKind.AVATAR),
+            )
+        }
+        return LinkPreview(
+            platformId = platformId,
+            kind = LinkKinds.VIDEO,
+            id = postId,
+            url = url?.takeIf { it.isNotBlank() } ?: dynamicLink(postId),
+            title = video.title.takeIf { it.isNotBlank() }
+                ?: text.takeIf { it.isNotBlank() }
+                ?: "微博视频 $postId",
+            description = video.description.takeIf { it.isNotBlank() } ?: text,
+            badge = "视频",
+            cover = video.coverUrl?.takeIf { it.isNotBlank() }?.let { MediaRef(it, MediaKind.COVER) },
+            publisher = publisher,
+            metrics = listOfNotNull(
+                metrics.reposts?.let { DynamicMetric("repost", raw = it) },
+                metrics.comments?.let { DynamicMetric("comment", raw = it) },
+                metrics.likes?.let { DynamicMetric("like", raw = it) },
+            ),
+            durationSeconds = video.durationSeconds,
         )
     }
 

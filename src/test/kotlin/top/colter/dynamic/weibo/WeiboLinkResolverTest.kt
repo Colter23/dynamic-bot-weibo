@@ -78,6 +78,36 @@ class WeiboLinkResolverTest {
     }
 
     @Test
+    fun `resolve video dynamic link as video preview`() = runBlocking {
+        val videoPost = post.copy(
+            card = WeiboMediaCardSnapshot(
+                kind = WeiboMediaCardKind.VIDEO,
+                title = "测试视频",
+                description = "视频简介",
+                coverUrl = "https://example.com/cover.jpg",
+                mediaUrl = "https://example.com/video.mp4",
+                videoSources = listOf(WeiboVideoSourceSnapshot(1080, "https://example.com/video.mp4")),
+                durationSeconds = 90,
+            ),
+        )
+        val videoResolver = WeiboLinkResolver(
+            platformId = platformId,
+            gatewayProvider = { FakeGateway(videoPost) },
+            mapper = WeiboDynamicMapper(),
+            publisherInfoResolver = { publisher },
+        )
+        val parsed = assertNotNull(videoResolver.parseLink("https://weibo.com/detail/R1CXrAEh5"))
+
+        val resolution = videoResolver.resolveLink(parsed)
+
+        assertTrue(resolution is LinkResolution.Preview)
+        assertEquals(LinkKinds.DYNAMIC, resolution.parsedLink.kind)
+        assertEquals(LinkKinds.VIDEO, resolution.preview.kind)
+        assertEquals("测试视频", resolution.preview.title)
+        assertEquals(90, resolution.preview.durationSeconds)
+    }
+
+    @Test
     fun `resolve user preview`() = runBlocking {
         val parsed = assertNotNull(resolver.parseLink("https://weibo.com/u/5977716744"))
 

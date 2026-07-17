@@ -26,6 +26,9 @@ import top.colter.dynamic.core.event.SubscriptionChangedEvent
 import top.colter.dynamic.core.event.SubscriptionChangeType
 import top.colter.dynamic.core.link.LinkResolution
 import top.colter.dynamic.core.link.LinkResolver
+import top.colter.dynamic.core.link.LinkVideoDownloadRequest
+import top.colter.dynamic.core.link.LinkVideoDownloadResult
+import top.colter.dynamic.core.link.LinkVideoDownloader
 import top.colter.dynamic.core.link.ParsedLink
 import top.colter.dynamic.core.plugin.PluginContext
 import top.colter.dynamic.core.plugin.FollowActionResult
@@ -60,6 +63,7 @@ internal class WeiboPublisherRuntime() :
     PublisherFollowPlugin,
     PublisherLoginProvider,
     LinkResolver,
+    LinkVideoDownloader,
     ConfigurablePlugin<WeiboPublisherConfig> {
 
     private var pluginId: String = DEFAULT_PLUGIN_ID
@@ -340,6 +344,12 @@ internal class WeiboPublisherRuntime() :
 
     override suspend fun resolveLink(parsedLink: ParsedLink): LinkResolution {
         return linkResolver.resolveLink(parsedLink)
+    }
+
+    override suspend fun downloadVideoLink(request: LinkVideoDownloadRequest): LinkVideoDownloadResult {
+        return requestFailureHandler.run("微博视频下载 id=${request.parsedLink.targetId}") {
+            gateway.downloadVideoLink(request)
+        }.getOrThrow()
     }
 
     override suspend fun loginByCookie(cookie: String): PublisherLoginResult {

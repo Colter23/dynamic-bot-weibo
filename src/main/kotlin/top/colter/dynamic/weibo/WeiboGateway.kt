@@ -3,6 +3,9 @@ package top.colter.dynamic.weibo
 import top.colter.dynamic.core.plugin.FollowActionResult
 import top.colter.dynamic.core.plugin.FollowActionStatus
 import top.colter.dynamic.core.plugin.FollowState
+import top.colter.dynamic.core.link.LinkVideoDownloadRequest
+import top.colter.dynamic.core.link.LinkVideoDownloadResult
+import top.colter.dynamic.core.link.LinkVideoQuality
 import top.colter.dynamic.core.plugin.PublisherLoginResult
 import top.colter.dynamic.core.plugin.PublisherQrLoginChallenge
 import top.colter.dynamic.core.plugin.PublisherLoginStatus
@@ -70,8 +73,14 @@ internal data class WeiboMediaCardSnapshot(
     val info: String? = null,
     val coverUrl: String? = null,
     val mediaUrl: String? = null,
+    val videoSources: List<WeiboVideoSourceSnapshot> = emptyList(),
     val durationSeconds: Long? = null,
     val url: String? = null,
+)
+
+internal data class WeiboVideoSourceSnapshot(
+    val quality: Int,
+    val url: String,
 )
 
 internal enum class WeiboMediaCardKind {
@@ -159,6 +168,10 @@ internal interface WeiboGateway {
         throw UnsupportedOperationException("不支持微博详情查询")
     }
 
+    suspend fun downloadVideoLink(request: LinkVideoDownloadRequest): LinkVideoDownloadResult {
+        throw UnsupportedOperationException("不支持微博视频下载")
+    }
+
     suspend fun fetchAssignedFollowGroups(userId: String): List<WeiboFollowGroupSnapshot> {
         return emptyList()
     }
@@ -202,4 +215,67 @@ internal class UnsupportedWeiboGateway : WeiboGateway {
     override suspend fun fetchPublisherSnapshot(userId: String): WeiboPublisherSnapshot? = null
 
     override suspend fun fetchPostDetail(postId: String): WeiboPostSnapshot? = null
+}
+
+internal fun WeiboPostSnapshot.findDownloadableVideo(): WeiboMediaCardSnapshot? {
+    return sequenceOf(card)
+        .plus(additionalCards.asSequence())
+        .filterNotNull()
+        .firstOrNull { media ->
+            media.kind == WeiboMediaCardKind.VIDEO && media.selectVideoSource(LinkVideoQuality.AUTO_HIGHEST) != null
+        }
+}
+
+internal fun WeiboMediaCardSnapshot.selectVideoSource(
+    quality: LinkVideoQuality,
+): WeiboVideoSourceSnapshot? {
+    val sources = videoSources
+        .asSequence()
+        .filter { it.url.isHttpUrl() }
+        .distinctBy { it.url }
+        .toList()
+        .ifEmpty {
+            mediaUrl
+                ?.takeIf(String::isHttpUrl)
+                ?.let { listOf(WeiboVideoSourceSnapshot(quality = 0, url = it)) }
+                .orEmpty()
+        }
+    if (sources.isEmpty()) return null
+
+    if (quality == LinkVideoQuality.AUTO_LOWEST) {
+        return sources.minWithOrNull(compareBy<WeiboVideoSourceSnapshot> { it.quality }.thenBy { it.url })
+    }
+    val targetQuality = quality.maximumHeight() ?: return sources.maxWithOrNull(
+        compareBy<WeiboVideoSourceSnapshot> { it.quality }.thenBy { it.url },
+    )
+    return sources
+        .filter { it.quality in 1..targetQuality }
+        .maxWithOrNull(compareBy<WeiboVideoSourceSnapshot> { it.quality }.thenBy { it.url })
+        ?: sources.minWithOrNull(compareBy<WeiboVideoSourceSnapshot> { it.quality }.thenBy { it.url })
+}
+
+private fun LinkVideoQuality.maximumHeight(): Int? {
+    return when (this) {
+        LinkVideoQuality.P240 -> 240
+        LinkVideoQuality.P360 -> 360
+        LinkVideoQuality.P480 -> 480
+        LinkVideoQuality.P720,
+        LinkVideoQuality.P720_60,
+        -> 720
+        LinkVideoQuality.P1080,
+        LinkVideoQuality.P1080_60,
+        -> 1080
+        LinkVideoQuality.P1080_PLUS -> 1500
+        LinkVideoQuality.P4K -> 2200
+        LinkVideoQuality.HDR,
+        LinkVideoQuality.DOLBY,
+        LinkVideoQuality.P8K,
+        LinkVideoQuality.AUTO_HIGHEST,
+        -> null
+        LinkVideoQuality.AUTO_LOWEST -> error("AUTO_LOWEST 已在调用前处理")
+    }
+}
+
+internal fun String.isHttpUrl(): Boolean {
+    return startsWith("https://", ignoreCase = true) || startsWith("http://", ignoreCase = true)
 }

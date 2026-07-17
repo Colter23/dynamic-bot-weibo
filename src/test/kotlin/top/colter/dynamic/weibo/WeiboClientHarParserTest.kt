@@ -136,6 +136,10 @@ class WeiboClientHarParserTest {
         assertEquals("真正的视频标题", post.card?.title)
         assertEquals("9.9万次观看", post.card?.info)
         assertEquals("https://example.com/1080.mp4", post.card?.mediaUrl)
+        assertEquals(
+            listOf("https://example.com/480.mp4", "https://example.com/1080.mp4"),
+            post.card?.videoSources?.map { it.url },
+        )
     }
 
     @Test
