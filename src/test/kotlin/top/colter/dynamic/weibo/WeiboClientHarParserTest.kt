@@ -257,6 +257,86 @@ class WeiboClientHarParserTest {
     }
 
     @Test
+    fun `parse legacy SSO JSONP response`() {
+        val response = client.parseSsoResponse(
+            """window.STK_1 && STK_1({"retcode":20000000,"msg":"succ","data":{"alt":"token"}})""",
+        )
+
+        assertNotNull(response)
+        assertEquals("20000000", response.getValue("retcode").jsonPrimitive.content)
+        assertEquals("token", response.getValue("data").jsonObject.getValue("alt").jsonPrimitive.content)
+    }
+
+    @Test
+    fun `parse QR code response from latest har`() {
+        val response = harResponse("扫码登录.har", "/sso/v2/qrcode/image") ?: return
+
+        val qrCode = client.parseQrCodeResponse(response)
+
+        assertNotNull(qrCode)
+        assertTrue(qrCode.id.isNotBlank())
+        assertEquals("v2.qr.weibo.cn", client.parseQrCodeImageUri(qrCode.imageUrl)?.host)
+    }
+
+    @Test
+    fun `parse QR login waiting response from latest har`() {
+        val response = harResponse("扫码登录.har", "/sso/v2/qrcode/check") ?: return
+
+        val poll = client.parseQrLoginPollResponse(response)
+
+        assertNotNull(poll)
+        assertEquals(50_114_001L, poll.code)
+    }
+
+    @Test
+    fun `parse QR login confirmation response with login url`() {
+        val poll = client.parseQrLoginPollResponse(
+            """{"retcode":20000000,"msg":"succ","data":{"url":"https://passport.weibo.com/sso/v2/login?entry=miniblog&alt=token"}}""",
+        )
+
+        assertNotNull(poll)
+        assertEquals("https://passport.weibo.com/sso/v2/login?entry=miniblog&alt=token", poll.loginUrl)
+        assertEquals(
+            "https://passport.weibo.com/sso/v2/login?entry=miniblog&alt=token",
+            client.parseQrLoginUri(poll.loginUrl.orEmpty())?.toString(),
+        )
+        assertEquals(null, client.parseQrLoginUri("https://example.com/sso/v2/login?alt=token"))
+    }
+
+    @Test
+    fun `normalize relative QR code image urls`() {
+        val protocolRelative = client.parseQrCodeImageUri(
+            "//v2.qr.weibo.cn/inf/gen?output_type=img",
+        )
+        val rootRelative = client.parseQrCodeImageUri(
+            "/inf/gen?output_type=img",
+        )
+        val insecure = client.parseQrCodeImageUri(
+            "http://v2.qr.weibo.cn/inf/gen?output_type=img",
+        )
+
+        assertEquals(
+            "https://v2.qr.weibo.cn/inf/gen?output_type=img",
+            protocolRelative?.toString(),
+        )
+        assertEquals(protocolRelative, rootRelative)
+        assertEquals(protocolRelative, insecure)
+        assertEquals(null, client.parseQrCodeImageUri("https://example.com/qr.png"))
+    }
+
+    @Test
+    fun `parse SSO meta redirect`() {
+        val redirect = client.parseSsoMetaRedirect(
+            """<script>location.replace('https://login.sina.com.cn/crossdomain2.php?action=login&amp;entry=sso')</script>""",
+        )
+
+        assertEquals(
+            "https://login.sina.com.cn/crossdomain2.php?action=login&entry=sso",
+            redirect,
+        )
+    }
+
+    @Test
     fun `parse follow action responses from har`() {
         val follow = harResponse("4.关注.har", "/ajax/friendships/create") ?: return
         val unfollow = harResponse("4.关注.har", "/ajax/friendships/destory") ?: return

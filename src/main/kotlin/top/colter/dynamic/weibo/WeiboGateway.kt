@@ -4,6 +4,7 @@ import top.colter.dynamic.core.plugin.FollowActionResult
 import top.colter.dynamic.core.plugin.FollowActionStatus
 import top.colter.dynamic.core.plugin.FollowState
 import top.colter.dynamic.core.plugin.PublisherLoginResult
+import top.colter.dynamic.core.plugin.PublisherQrLoginChallenge
 import top.colter.dynamic.core.plugin.PublisherLoginStatus
 
 internal data class WeiboPublisherSnapshot(
@@ -122,6 +123,23 @@ internal interface WeiboGateway {
         return PublisherLoginResult(
             status = PublisherLoginStatus.UNSUPPORTED,
             message = "不支持微博登录状态检查",
+        )
+    }
+
+    suspend fun loginByQrCode(
+        onQrCode: suspend (PublisherQrLoginChallenge) -> Unit,
+        onStatusChanged: suspend (PublisherLoginResult) -> Unit = { _ -> },
+    ): PublisherLoginResult {
+        return PublisherLoginResult(
+            status = PublisherLoginStatus.UNSUPPORTED,
+            message = "不支持微博二维码登录",
+        )
+    }
+
+    suspend fun refreshLoginSession(): PublisherLoginResult {
+        return PublisherLoginResult(
+            status = PublisherLoginStatus.UNSUPPORTED,
+            message = "不支持微博会话恢复",
         )
     }
 

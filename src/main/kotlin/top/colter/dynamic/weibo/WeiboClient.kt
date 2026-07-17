@@ -23,6 +23,7 @@ import top.colter.dynamic.core.plugin.FollowState
 import top.colter.dynamic.core.plugin.PublisherLoginAccount
 import top.colter.dynamic.core.plugin.PublisherLoginResult
 import top.colter.dynamic.core.plugin.PublisherLoginStatus
+import top.colter.dynamic.core.plugin.PublisherQrLoginChallenge
 import top.colter.dynamic.core.tools.loggerFor
 import java.net.CookieManager
 import java.net.CookiePolicy
@@ -37,10 +38,28 @@ import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.util.LinkedHashMap
 import java.util.Locale
 
 private val logger = loggerFor<WeiboClient>()
+
+internal data class WeiboQrCodeSnapshot(
+    val id: String,
+    val imageUrl: String,
+)
+
+internal data class WeiboQrLoginPollSnapshot(
+    val code: Long,
+    val message: String,
+    val loginUrl: String? = null,
+)
+
+private data class WeiboSsoToken(
+    val alt: String,
+    val saveState: Int,
+)
 
 internal class WeiboClient(
     private val config: WeiboPublisherConfig,
@@ -49,7 +68,7 @@ internal class WeiboClient(
     private var cachedLoginAccount: PublisherLoginAccount? = null
 
     suspend fun checkLoginState(): PublisherLoginResult {
-        val hasCookie = config.cookie.trim().isNotBlank()
+        val hasCookie = currentCookieHeader().isNotBlank()
         if (!hasCookie) {
             return PublisherLoginResult(
                 status = PublisherLoginStatus.FAILED,
@@ -57,7 +76,8 @@ internal class WeiboClient(
             )
         }
 
-        val account = fetchCurrentAccount()
+        // 显式检查必须重新访问首页，不能使用关注流构造时缓存的账号信息。
+        val account = fetchCurrentAccount(forceRefresh = true)
         if (account == null) {
             return PublisherLoginResult(
                 status = PublisherLoginStatus.FAILED,
@@ -70,6 +90,147 @@ internal class WeiboClient(
             message = "微博登录状态可用",
             account = account,
         )
+    }
+
+    suspend fun loginByQrCode(
+        onQrCode: suspend (PublisherQrLoginChallenge) -> Unit,
+        onStatusChanged: suspend (PublisherLoginResult) -> Unit = { _ -> },
+    ): PublisherLoginResult {
+        return try {
+            requestQrLoginPage()
+            val qrCode = requestQrCode()
+            val qrImageBytes = downloadQrCodeImage(qrCode.imageUrl)
+            onQrCode(
+                PublisherQrLoginChallenge(
+                    qrImageBytes = qrImageBytes,
+                    expiresAtEpochSeconds = System.currentTimeMillis() / 1_000 + QR_LOGIN_TIMEOUT_MILLIS / 1_000,
+                    message = "请使用微博 App 扫码并确认登录",
+                    instruction = "请使用微博 App 扫码并确认登录",
+                    validityHint = "三分钟内有效",
+                    statusPollIntervalMillis = QR_LOGIN_POLL_INTERVAL_MILLIS,
+                ),
+            )
+
+            val deadlineAtMillis = System.currentTimeMillis() + QR_LOGIN_TIMEOUT_MILLIS
+            var scanned = false
+            while (System.currentTimeMillis() < deadlineAtMillis) {
+                delay(QR_LOGIN_POLL_INTERVAL_MILLIS)
+                val poll = requestQrLoginStatus(qrCode.id)
+                when (poll.code) {
+                    QR_LOGIN_WAITING_CODE -> Unit
+                    QR_LOGIN_SCANNED_CODE -> {
+                        if (!scanned) {
+                            scanned = true
+                            onStatusChanged(
+                                PublisherLoginResult(
+                                    status = PublisherLoginStatus.PENDING,
+                                    message = "已扫码，等待手机确认登录",
+                                ),
+                            )
+                        }
+                    }
+                    QR_LOGIN_SUCCESS_CODE -> {
+                        onStatusChanged(
+                            PublisherLoginResult(
+                                status = PublisherLoginStatus.PENDING,
+                                message = "扫码确认成功，正在获取登录会话",
+                            ),
+                        )
+                        return completeQrLogin(poll)
+                    }
+                    QR_LOGIN_EXPIRED_CODE -> {
+                        return PublisherLoginResult(
+                            status = PublisherLoginStatus.EXPIRED,
+                            message = poll.message.ifBlank { "微博二维码已过期" },
+                        )
+                    }
+                    QR_LOGIN_CANCELED_CODE -> {
+                        return PublisherLoginResult(
+                            status = PublisherLoginStatus.CANCELED,
+                            message = poll.message.ifBlank { "已取消微博二维码登录" },
+                        )
+                    }
+                    else -> {
+                        return PublisherLoginResult(
+                            status = PublisherLoginStatus.FAILED,
+                            message = poll.message.ifBlank { "微博二维码登录失败：code=${poll.code}" },
+                        )
+                    }
+                }
+            }
+            PublisherLoginResult(PublisherLoginStatus.EXPIRED, "微博二维码已过期")
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            PublisherLoginResult(
+                status = PublisherLoginStatus.FAILED,
+                message = error.message ?: "微博二维码登录失败",
+            )
+        }
+    }
+
+    suspend fun refreshLoginSession(): PublisherLoginResult {
+        if (!hasCookie("SRF")) {
+            return PublisherLoginResult(
+                status = PublisherLoginStatus.FAILED,
+                message = "微博会话恢复缺少 SRF Cookie",
+            )
+        }
+        return try {
+            val token = requestSsoRestoreToken()
+                ?: return PublisherLoginResult(PublisherLoginStatus.FAILED, "微博会话恢复未获取到 SSO 令牌")
+            val metaResponse = sendTextRequest(
+                uri = buildExternalUri(
+                    SSO_LOGIN_URI,
+                    listOf(
+                        "entry" to "sso",
+                        "returntype" to "META",
+                        "gateway" to "1",
+                        "alt" to token.alt,
+                        "savestate" to token.saveState.toString(),
+                    ),
+                ),
+                referer = WEIBO_HOME,
+                accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                xRequestedWith = false,
+            )
+            if (metaResponse.statusCode() !in 200..299) {
+                return PublisherLoginResult(
+                    status = PublisherLoginStatus.FAILED,
+                    message = "微博会话恢复 SSO 跳转失败：status=${metaResponse.statusCode()}",
+                )
+            }
+            val crossDomainUri = parseSsoMetaRedirect(metaResponse.body())
+                ?.let { value -> runCatching { URI.create(value) }.getOrNull() }
+                ?.takeIf { it.host == LOGIN_SINA_HOST }
+                ?: return PublisherLoginResult(PublisherLoginStatus.FAILED, "微博会话恢复未返回跨域跳转地址")
+            val crossResponse = sendJsonpRequest(
+                uri = buildExternalUri(
+                    crossDomainUri.toString(),
+                    listOf(
+                        "action" to "login",
+                        "entry" to "sso",
+                        "r" to WEIBO_HOME,
+                        "callback" to loginCallback(),
+                    ),
+                ),
+                operation = "恢复微博跨域会话",
+            )
+            val cross = parseSsoResponse(crossResponse)
+                ?: return PublisherLoginResult(PublisherLoginStatus.FAILED, "微博会话恢复跨域响应无效")
+            val urls = cross.array("arrURL").toUrlList()
+            if (urls.isEmpty()) {
+                return PublisherLoginResult(PublisherLoginStatus.FAILED, "微博会话恢复未返回 SSO 登录地址")
+            }
+            completeSsoLogin(urls)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            PublisherLoginResult(
+                status = PublisherLoginStatus.FAILED,
+                message = error.message ?: "微博会话恢复失败",
+            )
+        }
     }
 
     internal fun exportCookieHeader(): String {
@@ -452,6 +613,263 @@ internal class WeiboClient(
         )
     }
 
+    internal fun parseSsoResponse(body: String): JsonObject? {
+        val trimmed = body.trim()
+        runCatching { WEIBO_JSON.parseToJsonElement(trimmed).asObject() }
+            .getOrNull()
+            ?.let { return it }
+
+        val startIndex = trimmed.indexOf('(')
+        val endIndex = trimmed.lastIndexOf(')')
+        if (startIndex < 0 || endIndex <= startIndex) return null
+        return runCatching {
+            WEIBO_JSON.parseToJsonElement(trimmed.substring(startIndex + 1, endIndex)).asObject()
+        }.getOrNull()
+    }
+
+    internal fun parseQrCodeResponse(body: String): WeiboQrCodeSnapshot? {
+        val root = parseSsoResponse(body) ?: return null
+        if (root.long("retcode") != QR_LOGIN_SUCCESS_CODE) return null
+        val data = root.obj("data") ?: return null
+        val id = data.string("qrid") ?: return null
+        val imageUrl = data.string("image") ?: return null
+        return WeiboQrCodeSnapshot(id = id, imageUrl = imageUrl)
+    }
+
+    internal fun parseQrLoginPollResponse(body: String): WeiboQrLoginPollSnapshot? {
+        val root = parseSsoResponse(body) ?: return null
+        val code = root.long("retcode") ?: return null
+        val data = root.obj("data")
+        return WeiboQrLoginPollSnapshot(
+            code = code,
+            message = root.string("msg") ?: root.string("message").orEmpty(),
+            loginUrl = data?.string("url"),
+        )
+    }
+
+    internal fun parseQrCodeImageUri(imageUrl: String): URI? {
+        val value = imageUrl.trim().takeIf(String::isNotBlank) ?: return null
+        val normalized = when {
+            value.startsWith("//") -> "https:$value"
+            value.startsWith("/") -> "https://$QR_IMAGE_HOST$value"
+            "://" !in value -> "https://$QR_IMAGE_HOST/$value"
+            else -> value
+        }
+        val uri = runCatching { URI.create(normalized) }.getOrNull() ?: return null
+        val host = uri.host?.lowercase() ?: return null
+        if (host !in QR_IMAGE_HOSTS || (uri.port != -1 && uri.port != 80 && uri.port != 443)) {
+            return null
+        }
+        return when (uri.scheme?.lowercase()) {
+            "https" -> uri
+            "http" -> URI("https", uri.userInfo, host, -1, uri.path, uri.query, null)
+            else -> null
+        }
+    }
+
+    internal fun parseQrLoginUri(loginUrl: String): URI? {
+        val uri = runCatching { URI.create(loginUrl.trim()) }.getOrNull() ?: return null
+        if (
+            uri.scheme?.equals("https", ignoreCase = true) != true ||
+            !uri.host.equals(PASSPORT_HOST, ignoreCase = true) ||
+            uri.port != -1 ||
+            uri.path != SSO_QRCODE_LOGIN_PATH
+        ) {
+            return null
+        }
+        return uri
+    }
+
+    internal fun parseSsoMetaRedirect(html: String): String? {
+        val match = SSO_META_REDIRECT_PATTERN.find(html) ?: return null
+        return match.groupValues[2]
+            .replace("&amp;", "&")
+            .takeIf { it.startsWith("https://") || it.startsWith("http://") }
+    }
+
+    private suspend fun requestQrLoginPage() {
+        val uri = URI.create(PASSPORT_QR_SIGN_IN_URI)
+        val response = sendTextRequest(
+            uri = uri,
+            referer = WEIBO_HOME,
+            accept = LOGIN_DOCUMENT_ACCEPT,
+            xRequestedWith = false,
+            desktopDocument = true,
+        )
+        if (response.statusCode() !in 200..299) {
+            throw WeiboApiException("微博二维码登录初始化失败：status=${response.statusCode()}")
+        }
+    }
+
+    private suspend fun requestQrCode(): WeiboQrCodeSnapshot {
+        val response = sendQrLoginRequest(
+            uri = buildExternalUri(
+                SSO_QRCODE_IMAGE_URI,
+                listOf(
+                    "entry" to "miniblog",
+                    "size" to QR_LOGIN_SIZE.toString(),
+                ),
+            ),
+            operation = "获取微博二维码",
+        )
+        return parseQrCodeResponse(response)
+            ?: throw WeiboApiException("微博二维码响应无效")
+    }
+
+    private suspend fun requestQrLoginStatus(qrId: String): WeiboQrLoginPollSnapshot {
+        val response = sendQrLoginRequest(
+            uri = buildExternalUri(
+                SSO_QRCODE_CHECK_URI,
+                listOf(
+                    "entry" to "miniblog",
+                    "source" to "miniblog",
+                    "url" to QR_LOGIN_RETURN_URL,
+                    "qrid" to qrId,
+                    "disp" to "popup",
+                ),
+            ),
+            operation = "检查微博二维码状态",
+        )
+        return parseQrLoginPollResponse(response)
+            ?: throw WeiboApiException("微博二维码状态响应无效")
+    }
+
+    private suspend fun downloadQrCodeImage(imageUrl: String): ByteArray {
+        val imageUri = parseQrCodeImageUri(imageUrl)
+            ?: throw WeiboApiException("微博二维码图片地址无效")
+        val response = sendImageRequest(imageUri)
+        val contentType = response.headers().firstValue("Content-Type").orElse("")
+        return response.body().use { input ->
+            if (response.statusCode() !in 200..299) {
+                throw WeiboApiException("下载微博二维码图片失败：status=${response.statusCode()}")
+            }
+            if (!contentType.isPngContentType()) {
+                throw WeiboApiException("微博二维码图片响应类型无效：contentType=$contentType")
+            }
+            response.headers()
+                .firstValue("Content-Length")
+                .orElse(null)
+                ?.toLongOrNull()
+                ?.takeIf { it > MAX_QR_IMAGE_BYTES }
+                ?.let { size -> throw WeiboApiException("微博二维码图片超过大小限制：size=$size") }
+
+            val bytes = input.readBytesLimited(MAX_QR_IMAGE_BYTES)
+            if (bytes.isEmpty()) {
+                throw WeiboApiException("微博二维码图片为空")
+            }
+            if (!bytes.hasPngSignature()) {
+                throw WeiboApiException("微博二维码图片不是 PNG 格式")
+            }
+            bytes
+        }
+    }
+
+    private suspend fun completeQrLogin(poll: WeiboQrLoginPollSnapshot): PublisherLoginResult {
+        val loginUri = poll.loginUrl?.let(::parseQrLoginUri)
+        if (loginUri == null) {
+            return PublisherLoginResult(
+                status = PublisherLoginStatus.FAILED,
+                message = "微博二维码确认响应未提供登录地址",
+            )
+        }
+        val response = sendTextRequest(
+            uri = loginUri,
+            referer = PASSPORT_QR_SIGN_IN_URI,
+            accept = LOGIN_DOCUMENT_ACCEPT,
+            xRequestedWith = false,
+            desktopDocument = true,
+        )
+        if (response.statusCode() !in 200..299) {
+            return PublisherLoginResult(
+                status = PublisherLoginStatus.FAILED,
+                message = "微博二维码会话登录失败：status=${response.statusCode()}",
+            )
+        }
+        cachedLoginAccount = null
+        return checkLoginState()
+    }
+
+    private suspend fun requestSsoRestoreToken(): WeiboSsoToken? {
+        val response = sendJsonpRequest(
+            uri = buildExternalUri(
+                PASSPORT_VISITOR_URI,
+                listOf(
+                    "a" to "restore",
+                    "cb" to "restore_back",
+                    "from" to "weibo",
+                    "_rand" to System.currentTimeMillis().toString(),
+                ),
+            ),
+            operation = "获取微博会话恢复令牌",
+        )
+        val root = parseSsoResponse(response) ?: return null
+        if (root.long("retcode") != QR_LOGIN_SUCCESS_CODE) return null
+        val data = root.obj("data") ?: return null
+        val alt = data.string("alt") ?: return null
+        return WeiboSsoToken(
+            alt = alt,
+            saveState = data.long("savestate")?.toInt() ?: DEFAULT_SSO_SAVE_STATE,
+        )
+    }
+
+    private suspend fun completeSsoLogin(crossDomainUrls: List<String>): PublisherLoginResult {
+        val ssoLoginUrl = crossDomainUrls
+            .firstOrNull { url -> runCatching { URI.create(url) }.getOrNull()?.host == PASSPORT_HOST }
+            ?: return PublisherLoginResult(PublisherLoginStatus.FAILED, "微博 SSO 会话缺少登录地址")
+        val ssoResponse = sendTextRequest(
+            uri = buildExternalUri(
+                ssoLoginUrl,
+                listOf(
+                    "action" to "login",
+                    "callback" to loginCallback(),
+                ),
+            ),
+            referer = WEIBO_HOME,
+            accept = LOGIN_ACCEPT,
+            xRequestedWith = false,
+        )
+        if (ssoResponse.statusCode() !in 200..299) {
+            return PublisherLoginResult(
+                status = PublisherLoginStatus.FAILED,
+                message = "微博二维码 SSO 登录失败：status=${ssoResponse.statusCode()}",
+            )
+        }
+        cachedLoginAccount = null
+        return checkLoginState()
+    }
+
+    private suspend fun sendJsonpRequest(
+        uri: URI,
+        operation: String,
+    ): String {
+        val response = sendTextRequest(
+            uri = uri,
+            referer = WEIBO_HOME,
+            accept = LOGIN_ACCEPT,
+            xRequestedWith = false,
+        )
+        if (response.statusCode() !in 200..299) {
+            throw WeiboApiException("${operation}失败：status=${response.statusCode()}")
+        }
+        return response.body()
+    }
+
+    private suspend fun sendQrLoginRequest(
+        uri: URI,
+        operation: String,
+    ): String {
+        val response = sendTextRequest(
+            uri = uri,
+            referer = PASSPORT_QR_SIGN_IN_URI,
+            accept = QR_LOGIN_ACCEPT,
+            xRequestedWith = true,
+        )
+        if (response.statusCode() !in 200..299) {
+            throw WeiboApiException("${operation}失败：status=${response.statusCode()}")
+        }
+        return response.body()
+    }
+
     private suspend fun getJson(
         path: String,
         parameters: List<Pair<String, String>>,
@@ -468,7 +886,12 @@ internal class WeiboClient(
             .apply {
                 currentCookieHeader().takeIf(String::isNotBlank)?.let { cookie ->
                     header("Cookie", cookie)
-                    cookie.xsrfToken()?.let { header("X-XSRF-TOKEN", it) }
+                    cookie.xsrfToken()?.let { token ->
+                        header("X-XSRF-TOKEN", token)
+                        if (uri.host.equals(PASSPORT_HOST, ignoreCase = true)) {
+                            header("X-CSRF-TOKEN", token)
+                        }
+                    }
                 }
             }
             .GET()
@@ -522,6 +945,21 @@ internal class WeiboClient(
 
         return withContext(Dispatchers.IO) {
             httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
+        }
+    }
+
+    private suspend fun sendImageRequest(uri: URI): HttpResponse<InputStream> {
+        val request = HttpRequest.newBuilder(uri)
+            .timeout(Duration.ofSeconds(15))
+            .header("Accept", "image/png,image/*;q=0.8,*/*;q=0.5")
+            .header("Accept-Language", "zh-CN,zh;q=0.9")
+            .header("User-Agent", DESKTOP_USER_AGENT)
+            // 二维码 URL 自带签名，无需向图片域名转发微博登录 Cookie。
+            .header("Referer", PASSPORT_QR_SIGN_IN_URI)
+            .GET()
+            .build()
+        return withContext(Dispatchers.IO) {
+            httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream())
         }
     }
 
@@ -603,6 +1041,16 @@ internal class WeiboClient(
         }
         return URI.create("$WEIBO_HOME$path?$query")
     }
+
+    private fun buildExternalUri(base: String, parameters: List<Pair<String, String>>): URI {
+        val query = parameters.joinToString("&") { (name, value) ->
+            "${name.urlEncode()}=${value.urlEncode()}"
+        }
+        val separator = if ('?' in base) '&' else '?'
+        return URI.create("$base$separator$query")
+    }
+
+    private fun loginCallback(): String = "STK_${System.currentTimeMillis()}"
 
     private fun JsonObject.toPublisherSnapshot(): WeiboPublisherSnapshot? {
         val userId = string("idstr") ?: long("id")?.toString() ?: return null
@@ -958,6 +1406,14 @@ internal class WeiboClient(
 
     private fun JsonElement.asPrimitive(): JsonPrimitive? = this as? JsonPrimitive
 
+    private fun JsonArray.toUrlList(): List<String> {
+        return mapNotNull { item ->
+            item.asPrimitive()?.contentOrNull ?: item.asObject()?.string("url")
+        }.filter { url ->
+            url.startsWith("https://") || url.startsWith("http://")
+        }
+    }
+
     private fun String.urlEncode(): String {
         return URLEncoder.encode(this, StandardCharsets.UTF_8)
     }
@@ -972,6 +1428,34 @@ internal class WeiboClient(
                 if (name == "XSRF-TOKEN") URLDecoder.decode(value, StandardCharsets.UTF_8) else null
             }
             .firstOrNull { it.isNotBlank() }
+    }
+
+    private fun String.isPngContentType(): Boolean {
+        return substringBefore(';').trim().equals("image/png", ignoreCase = true)
+    }
+
+    private fun ByteArray.hasPngSignature(): Boolean {
+        return size >= PNG_SIGNATURE.size && indices.take(PNG_SIGNATURE.size).all { index -> this[index] == PNG_SIGNATURE[index] }
+    }
+
+    private fun InputStream.readBytesLimited(maxBytes: Int): ByteArray {
+        val output = ByteArrayOutputStream(minOf(maxBytes, QR_IMAGE_READ_BUFFER_SIZE))
+        val buffer = ByteArray(QR_IMAGE_READ_BUFFER_SIZE)
+        while (true) {
+            val count = read(buffer)
+            if (count < 0) break
+            if (output.size() > maxBytes - count) {
+                throw WeiboApiException("微博二维码图片超过大小限制：maxBytes=$maxBytes")
+            }
+            output.write(buffer, 0, count)
+        }
+        return output.toByteArray()
+    }
+
+    private fun hasCookie(name: String): Boolean {
+        return currentCookieHeader()
+            .split(';')
+            .any { item -> item.substringBefore('=').trim() == name }
     }
 
     private fun String.toPlainWeiboText(): String {
@@ -1032,8 +1516,10 @@ internal class WeiboClient(
             ?.firstOrNull(String::isNotBlank)
     }
 
-    private suspend fun fetchCurrentAccount(): PublisherLoginAccount? {
-        cachedLoginAccount?.let { return it }
+    private suspend fun fetchCurrentAccount(forceRefresh: Boolean = false): PublisherLoginAccount? {
+        if (!forceRefresh) {
+            cachedLoginAccount?.let { return it }
+        }
         val account = try {
             fetchHomeAccount()
         } catch (error: CancellationException) {
@@ -1043,6 +1529,7 @@ internal class WeiboClient(
             null
         }
         if (account == null) {
+            cachedLoginAccount = null
             logger.debug { "微博当前账号识别失败：PC 首页未包含 window.\$CONFIG.user" }
             return null
         }
@@ -1134,11 +1621,54 @@ internal class WeiboClient(
         private const val DEFAULT_FRIEND_TIMELINE_LIST_PREFIX: String = "11000"
         private const val DEFAULT_FRIEND_TIMELINE_TITLE: String = "最新微博"
         private const val FRIEND_TIMELINE_API_PATH: String = "statuses/friends/timeline"
+        private const val PASSPORT_HOST: String = "passport.weibo.com"
+        private const val LOGIN_SINA_HOST: String = "login.sina.com.cn"
+        private const val QR_IMAGE_HOST: String = "v2.qr.weibo.cn"
+        private const val PASSPORT_VISITOR_URI: String = "https://passport.weibo.com/visitor/visitor"
+        private const val PASSPORT_QR_SIGN_IN_URI: String =
+            "https://passport.weibo.com/sso/signin?entry=miniblog&source=miniblog&disp=popup&url=https%3A%2F%2Fweibo.com%2Fnewlogin%3Ftabtype%3Dweibo%26gid%3D102803%26openLoginLayer%3D0%26url%3Dhttps%3A%2F%2Fweibo.com%2F&from=weibopro"
+        private const val SSO_QRCODE_IMAGE_URI: String = "https://passport.weibo.com/sso/v2/qrcode/image"
+        private const val SSO_QRCODE_CHECK_URI: String = "https://passport.weibo.com/sso/v2/qrcode/check"
+        private const val SSO_QRCODE_LOGIN_URI: String = "https://passport.weibo.com/sso/v2/login"
+        private const val SSO_QRCODE_LOGIN_PATH: String = "/sso/v2/login"
+        private const val SSO_LOGIN_URI: String = "https://login.sina.com.cn/sso/login.php"
+        private const val LOGIN_ACCEPT: String = "text/javascript, application/javascript, */*; q=0.01"
+        private const val LOGIN_DOCUMENT_ACCEPT: String =
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        private const val QR_LOGIN_ACCEPT: String = "application/json, text/plain, */*"
+        private const val QR_LOGIN_RETURN_URL: String =
+            "https://weibo.com/newlogin?tabtype=weibo&gid=102803&openLoginLayer=0&url=https://weibo.com/"
+        private const val QR_LOGIN_SUCCESS_CODE: Long = 20_000_000
+        private const val QR_LOGIN_WAITING_CODE: Long = 50_114_001
+        private const val QR_LOGIN_SCANNED_CODE: Long = 50_114_002
+        private const val QR_LOGIN_EXPIRED_CODE: Long = 50_114_003
+        private const val QR_LOGIN_CANCELED_CODE: Long = 50_114_004
+        private const val QR_LOGIN_SIZE: Int = 180
+        private const val QR_LOGIN_POLL_INTERVAL_MILLIS: Long = 3_000
+        private const val QR_LOGIN_TIMEOUT_MILLIS: Long = 180_000
+        private const val DEFAULT_SSO_SAVE_STATE: Int = 30
+        private const val MAX_QR_IMAGE_BYTES: Int = 1_024 * 1_024
+        private const val QR_IMAGE_READ_BUFFER_SIZE: Int = 8 * 1_024
         private const val DESKTOP_USER_AGENT: String =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0"
         private const val UNKNOWN_WEIBO_USER_ID: String = "__unknown__"
         private const val UNKNOWN_WEIBO_USER_NAME: String = "未知微博用户"
         private const val WINDOW_CONFIG_MARKER: String = "window.\$CONFIG"
+        private val PNG_SIGNATURE: ByteArray = byteArrayOf(
+            0x89.toByte(),
+            0x50,
+            0x4E,
+            0x47,
+            0x0D,
+            0x0A,
+            0x1A,
+            0x0A,
+        )
+        private val QR_IMAGE_HOSTS: Set<String> = setOf(QR_IMAGE_HOST)
+        private val SSO_META_REDIRECT_PATTERN: Regex = Regex(
+            """location\.replace\(\s*(['\"])(.*?)\1\s*\)""",
+            RegexOption.IGNORE_CASE,
+        )
         private val WEIBO_JSON: Json = Json {
             ignoreUnknownKeys = true
         }
@@ -1183,6 +1713,17 @@ internal class WeiboHttpGateway(
         return withRequestInterval {
             client.checkLoginState()
         }
+    }
+
+    override suspend fun loginByQrCode(
+        onQrCode: suspend (PublisherQrLoginChallenge) -> Unit,
+        onStatusChanged: suspend (PublisherLoginResult) -> Unit,
+    ): PublisherLoginResult {
+        return client.loginByQrCode(onQrCode, onStatusChanged)
+    }
+
+    override suspend fun refreshLoginSession(): PublisherLoginResult {
+        return client.refreshLoginSession()
     }
 
     override suspend fun fetchPublisherSnapshot(userId: String): WeiboPublisherSnapshot? {

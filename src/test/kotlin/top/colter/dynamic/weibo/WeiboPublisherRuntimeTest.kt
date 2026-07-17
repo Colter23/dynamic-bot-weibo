@@ -39,6 +39,8 @@ import top.colter.dynamic.core.plugin.SourceStateStore
 import top.colter.dynamic.core.plugin.SubscriptionQueryService
 import top.colter.dynamic.core.plugin.PublisherLoginResult
 import top.colter.dynamic.core.plugin.PublisherLoginStatus
+import top.colter.dynamic.core.plugin.PublisherLoginMethod
+import top.colter.dynamic.core.plugin.PublisherQrLoginChallenge
 import top.colter.dynamic.core.task.TaskDefinition
 import top.colter.dynamic.core.task.TaskScheduler
 import top.colter.dynamic.core.task.TaskSnapshot
@@ -52,6 +54,46 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 class WeiboPublisherRuntimeTest {
+    @Test
+    fun `qr login persists cookie and starts polling`() = runBlocking {
+        val challenge = PublisherQrLoginChallenge(
+            qrContent = "https://example.com/weibo-qr",
+            message = "请扫码",
+        )
+        val gateway = RecordingWeiboGateway(
+            exportedCookie = "SUB=qr-session; XSRF-TOKEN=qr-token",
+            qrChallenge = challenge,
+            qrLoginResult = PublisherLoginResult(
+                status = PublisherLoginStatus.SUCCESS,
+                message = "微博二维码登录成功",
+            ),
+        )
+        val scheduler = ManualTaskScheduler()
+        var savedConfig: WeiboPublisherConfig? = null
+        val runtime = WeiboPublisherRuntime(
+            loadConfig = { WeiboPublisherConfig(pollingEnabled = true, cookie = "SUB=old") },
+            gatewayFactory = { gateway },
+            cursorStoreFactory = { InMemoryWeiboCursorStore() },
+            saveConfig = { _, config -> savedConfig = config },
+            taskScheduler = scheduler,
+        )
+        runtime.onLoad(testContext(RecordingSourceUpdatePublisher(), FixedSubscriptionQueryService(emptyList())))
+
+        val challenges = mutableListOf<PublisherQrLoginChallenge>()
+        val statuses = mutableListOf<PublisherLoginStatus>()
+        val result = runtime.loginByQrCode(
+            onQrCode = { challenges += it },
+            onStatusChanged = { statuses += it.status },
+        )
+
+        assertEquals(PublisherLoginStatus.SUCCESS, result.status)
+        assertEquals(listOf(challenge), challenges)
+        assertTrue(PublisherLoginStatus.SUCCESS in statuses)
+        assertTrue(PublisherLoginMethod.QR_CODE in runtime.supportedLoginMethods)
+        assertEquals("SUB=qr-session; XSRF-TOKEN=qr-token", savedConfig?.cookie)
+        assertTrue(scheduler.isRunning("weibo-detect"))
+    }
+
     @Test
     fun `startup login check failure does not pause polling or notify administrators`() = runBlocking {
         val gateway = RecordingWeiboGateway(
@@ -93,6 +135,89 @@ class WeiboPublisherRuntimeTest {
         assertFalse(scheduler.isRunning("weibo-detect"))
         assertEquals(4, gateway.loginCheckCount)
         assertEquals(emptyList(), notifications)
+    }
+
+    @Test
+    fun `startup restores expired session before starting polling`() = runBlocking {
+        val gateway = RecordingWeiboGateway(
+            exportedCookie = "SUB=restored; XSRF-TOKEN=fresh",
+            loginResult = PublisherLoginResult(
+                status = PublisherLoginStatus.FAILED,
+                message = "Cookie 已失效",
+            ),
+            refreshLoginResult = PublisherLoginResult(
+                status = PublisherLoginStatus.SUCCESS,
+                message = "微博登录状态可用",
+            ),
+        )
+        val scheduler = ManualTaskScheduler()
+        var savedConfig: WeiboPublisherConfig? = null
+        val runtime = WeiboPublisherRuntime(
+            loadConfig = { WeiboPublisherConfig(pollingEnabled = true, cookie = "SUB=expired; SRF=restore") },
+            gatewayFactory = { gateway },
+            cursorStoreFactory = { InMemoryWeiboCursorStore() },
+            saveConfig = { _, config -> savedConfig = config },
+            taskScheduler = scheduler,
+        )
+        runtime.onLoad(testContext(RecordingSourceUpdatePublisher(), FixedSubscriptionQueryService(emptyList())))
+
+        runtime.onStart()
+
+        assertEquals(1, gateway.refreshLoginCount)
+        assertEquals("SUB=restored; XSRF-TOKEN=fresh", savedConfig?.cookie)
+        assertTrue(scheduler.isRunning("weibo-detect"))
+    }
+
+    @Test
+    fun `paused polling attempts session recovery before skipping future checks`() = runBlocking {
+        val loginAvailable = PublisherLoginResult(PublisherLoginStatus.SUCCESS, "微博登录状态可用")
+        val loginExpired = PublisherLoginResult(PublisherLoginStatus.FAILED, "Cookie 已失效")
+        val gateway = object : RecordingWeiboGateway(
+            loginResults = listOf(loginAvailable, loginExpired),
+            refreshLoginResult = loginAvailable,
+        ) {
+            private var followTimelineCount: Int = 0
+
+            override suspend fun fetchFollowTimeline(sinceEpochSeconds: Long?): WeiboTimelinePage {
+                followTimelineCount += 1
+                if (followTimelineCount == 2) {
+                    throw WeiboLoginException("Cookie 已失效")
+                }
+                return super.fetchFollowTimeline(sinceEpochSeconds)
+            }
+        }
+        val scheduler = ManualTaskScheduler()
+        val notifications = mutableListOf<SystemNotificationPublishRequest>()
+        val runtime = WeiboPublisherRuntime(
+            loadConfig = {
+                WeiboPublisherConfig(
+                    pollingEnabled = true,
+                    replayWindowMinutes = 0,
+                    maxConsecutiveLoginFailures = 1,
+                    cookie = "SUB=expired; SRF=restore",
+                )
+            },
+            gatewayFactory = { gateway },
+            cursorStoreFactory = { InMemoryWeiboCursorStore() },
+            taskScheduler = scheduler,
+        )
+        runtime.onLoad(
+            testContext(
+                updates = RecordingSourceUpdatePublisher(),
+                subscriptions = FixedSubscriptionQueryService(listOf(testPublisher(1, "10001"))),
+                notificationPublisher = SystemNotificationPublisher { request ->
+                    notifications += request
+                    SystemNotificationPublishResult.accepted()
+                },
+            ),
+        )
+
+        runtime.onStart()
+        scheduler.runOnce("weibo-detect")
+        scheduler.runOnce("weibo-detect")
+
+        assertEquals(1, gateway.refreshLoginCount)
+        assertTrue(notifications.any { it.type == "weibo.login_recovered" })
     }
 
     @Test
@@ -557,27 +682,54 @@ class WeiboPublisherRuntimeTest {
         )
     }
 
-    private class RecordingWeiboGateway(
+    private open class RecordingWeiboGateway(
         private val posts: List<WeiboPostSnapshot> = emptyList(),
         private val followTimelinePages: List<WeiboTimelinePage> = emptyList(),
         private val exportedCookie: String = "",
         private val loginResult: PublisherLoginResult = PublisherLoginResult(PublisherLoginStatus.SUCCESS, "登录成功"),
+        private val loginResults: List<PublisherLoginResult> = emptyList(),
+        private val qrChallenge: PublisherQrLoginChallenge? = null,
+        private val qrLoginResult: PublisherLoginResult = PublisherLoginResult(
+            PublisherLoginStatus.UNSUPPORTED,
+            "不支持二维码登录",
+        ),
+        private val refreshLoginResult: PublisherLoginResult = PublisherLoginResult(
+            PublisherLoginStatus.UNSUPPORTED,
+            "不支持微博会话恢复",
+        ),
     ) : WeiboGateway {
         val followTimelineSinceValues: MutableList<Long?> = mutableListOf()
         val enrichedPostIds: MutableList<String> = mutableListOf()
         var loginCheckCount: Int = 0
+            private set
+        var refreshLoginCount: Int = 0
             private set
 
         override fun exportCookie(): String = exportedCookie
 
         override suspend fun checkLoginState(): PublisherLoginResult {
             loginCheckCount += 1
-            return loginResult
+            return loginResults.getOrNull(loginCheckCount - 1) ?: loginResult
+        }
+
+        override suspend fun loginByQrCode(
+            onQrCode: suspend (PublisherQrLoginChallenge) -> Unit,
+            onStatusChanged: suspend (PublisherLoginResult) -> Unit,
+        ): PublisherLoginResult {
+            if (qrChallenge != null) {
+                onQrCode(qrChallenge)
+            }
+            return qrLoginResult
+        }
+
+        override suspend fun refreshLoginSession(): PublisherLoginResult {
+            refreshLoginCount += 1
+            return refreshLoginResult
         }
 
         override suspend fun fetchPublisherSnapshot(userId: String): WeiboPublisherSnapshot? = null
 
-        override suspend fun fetchFollowTimeline(sinceEpochSeconds: Long?): WeiboTimelinePage {
+        open override suspend fun fetchFollowTimeline(sinceEpochSeconds: Long?): WeiboTimelinePage {
             followTimelineSinceValues += sinceEpochSeconds
             return followTimelinePages.getOrNull(followTimelineSinceValues.lastIndex)
                 ?: WeiboTimelinePage(posts = posts)
