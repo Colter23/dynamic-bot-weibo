@@ -27,6 +27,7 @@ import top.colter.dynamic.core.plugin.PublisherLoginResult
 import top.colter.dynamic.core.plugin.PublisherLoginStatus
 import top.colter.dynamic.core.plugin.PublisherQrLoginChallenge
 import top.colter.dynamic.core.tools.loggerFor
+import java.net.CookieHandler
 import java.net.CookieManager
 import java.net.CookiePolicy
 import java.net.HttpCookie
@@ -44,6 +45,7 @@ import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.util.LinkedHashMap
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 private val logger = loggerFor<WeiboClient>()
 
@@ -63,9 +65,84 @@ private data class WeiboSsoToken(
     val saveState: Int,
 )
 
+/**
+ * 微博 Cookie 容器。与直接用 [CookieManager] 有三处刻意差异：
+ *
+ * 1. 不用配置里的 cookie 预填充 CookieStore。配置值由 [WeiboClient.currentCookieHeader] 作为兜底参与拼接，
+ *    服务端实际下发的 cookie 始终排在后面并覆盖同名配置值。预填充会凭空造出 `.weibo.com` 域的条目，
+ *    与服务端 host-only 的同名 cookie 在 store 里并存，取值就取决于插入顺序了。
+ * 2. [get] 固定返回空，发送时完全由 [WeiboClient] 自己拼接 Cookie 头。否则 JDK 会把 CookieStore 里的内容
+ *    再追加一遍，与服务端实际收到的手动头重复，白白放大请求体积。
+ * 3. [put] 在交给 CookieStore 之前记录服务端显式删除的 cookie 名。[CookieManager] 只对 `Max-Age=0`
+ *    真正删除条目；`Expires` 已过期时只会新增一条过期 cookie，旧值仍留在 store 里。记录删除名可以同时
+ *    清掉 store 残留和配置兜底，并在服务端重新设置同名 cookie 时自动解除。
+ */
+internal class WeiboCookieJar : CookieHandler() {
+    private val manager: CookieManager = CookieManager(null, CookiePolicy.ACCEPT_ALL)
+    private val removedNames: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    val cookieManager: CookieManager
+        get() = manager
+
+    val removedCookieNames: Set<String>
+        get() = removedNames
+
+    override fun get(uri: URI, requestHeaders: Map<String, List<String>>): Map<String, List<String>> {
+        return emptyMap()
+    }
+
+    override fun put(uri: URI, responseHeaders: Map<String, List<String>>) {
+        recordRemovedCookies(uri, responseHeaders)
+        manager.put(uri, responseHeaders)
+    }
+
+    private fun recordRemovedCookies(uri: URI, responseHeaders: Map<String, List<String>>) {
+        responseHeaders.forEach headerLoop@{ (headerName, values) ->
+            if (!headerName.equals(SET_COOKIE_HEADER, ignoreCase = true) &&
+                !headerName.equals(SET_COOKIE2_HEADER, ignoreCase = true)
+            ) {
+                return@headerLoop
+            }
+            values.forEach { value ->
+                runCatching { HttpCookie.parse(value) }
+                    .getOrDefault(emptyList())
+                    .filter { it.name.isNotBlank() }
+                    .forEach { cookie ->
+                        // 只追踪微博主域的会话 cookie：`passport.weibo.com`、`login.sina.com.cn` 上存在
+                        // 同名的 SUB/SUBP，那里的过期不应该把 weibo.com 的有效值一起滤掉。
+                        if (!isWeiboSessionCookie(uri, cookie)) return@forEach
+                        if (cookie.hasExpired()) {
+                            removedNames += cookie.name
+                        } else {
+                            removedNames -= cookie.name
+                        }
+                    }
+            }
+        }
+    }
+
+    private fun isWeiboSessionCookie(uri: URI, cookie: HttpCookie): Boolean {
+        val explicitDomain = cookie.domain?.trim()?.removePrefix(".")?.lowercase()?.takeIf(String::isNotBlank)
+        if (explicitDomain != null) {
+            // 带 Domain 属性的是跨子域共享的 cookie（如 `.weibo.com`），删除确实会影响 weibo.com 会话。
+            return explicitDomain == WEIBO_BASE_DOMAIN || explicitDomain.endsWith(".$WEIBO_BASE_DOMAIN")
+        }
+        // 无 Domain 属性的是 host-only cookie，只作用于当前主机；
+        // passport / qr 主机上的同名删除不应该波及 weibo.com 的配置兜底值。
+        val host = uri.host?.trim()?.lowercase()?.takeIf(String::isNotBlank) ?: return false
+        return host == WEIBO_BASE_DOMAIN
+    }
+
+    private companion object {
+        private const val SET_COOKIE_HEADER: String = "Set-Cookie"
+        private const val SET_COOKIE2_HEADER: String = "Set-Cookie2"
+        private const val WEIBO_BASE_DOMAIN: String = "weibo.com"
+    }
+}
+
 internal class WeiboClient(
     private val config: WeiboPublisherConfig,
-    private val httpClient: HttpClient = defaultHttpClient(config.cookie),
+    private val httpClient: HttpClient = defaultHttpClient(),
 ) {
     private var cachedLoginAccount: PublisherLoginAccount? = null
     private val videoDownloader = WeiboVideoDownloader(httpClient, DESKTOP_USER_AGENT)
@@ -237,7 +314,8 @@ internal class WeiboClient(
     }
 
     internal fun exportCookieHeader(): String {
-        return currentCookieHeader()
+        // 回存配置时以微博主域为准，优先导出 weibo.com 上的会话值（同名跨域 cookie 不会丢，只是不优先）。
+        return currentCookieHeader(URI.create(WEIBO_HOME).host)
     }
 
     suspend fun fetchHomeAccount(): PublisherLoginAccount? {
@@ -900,7 +978,7 @@ internal class WeiboClient(
             .header("Referer", referer)
             .header("X-Requested-With", "XMLHttpRequest")
             .apply {
-                currentCookieHeader().takeIf(String::isNotBlank)?.let { cookie ->
+                currentCookieHeader(uri.host).takeIf(String::isNotBlank)?.let { cookie ->
                     header("Cookie", cookie)
                     cookie.xsrfToken()?.let { token ->
                         header("X-XSRF-TOKEN", token)
@@ -951,7 +1029,7 @@ internal class WeiboClient(
                     header("Sec-Fetch-Site", "same-origin")
                     header("Sec-Fetch-User", "?1")
                 }
-                currentCookieHeader().takeIf(String::isNotBlank)?.let { cookie ->
+                currentCookieHeader(uri.host).takeIf(String::isNotBlank)?.let { cookie ->
                     header("Cookie", cookie)
                     cookie.xsrfToken()?.let { header("X-XSRF-TOKEN", it) }
                 }
@@ -987,7 +1065,8 @@ internal class WeiboClient(
         val body = parameters.joinToString("&") { (name, value) ->
             "${name.urlEncode()}=${value.urlEncode()}"
         }
-        val request = HttpRequest.newBuilder(URI.create("$WEIBO_HOME$path"))
+        val uri = URI.create("$WEIBO_HOME$path")
+        val request = HttpRequest.newBuilder(uri)
             .timeout(Duration.ofSeconds(15))
             .header("Accept", "application/json, text/plain, */*")
             .header("Accept-Language", "zh-CN,zh;q=0.9")
@@ -996,7 +1075,7 @@ internal class WeiboClient(
             .header("Referer", referer)
             .header("X-Requested-With", "XMLHttpRequest")
             .apply {
-                currentCookieHeader().takeIf(String::isNotBlank)?.let { cookie ->
+                currentCookieHeader(uri.host).takeIf(String::isNotBlank)?.let { cookie ->
                     header("Cookie", cookie)
                     cookie.xsrfToken()?.let { header("X-XSRF-TOKEN", it) }
                 }
@@ -1562,17 +1641,68 @@ internal class WeiboClient(
         return account
     }
 
-    private fun currentCookieHeader(): String {
-        return mergeCookieHeaders(config.cookie, cookieStoreHeader())
+    private fun currentCookieHeader(host: String? = null): String {
+        val removedNames = removedCookieNames()
+        val fallback = if (removedNames.isEmpty()) {
+            config.cookie
+        } else {
+            config.cookie.withoutCookies(removedNames)
+        }
+        return mergeCookieHeaders(fallback, cookieStoreHeader(host))
     }
 
-    private fun cookieStoreHeader(): String {
-        val cookieManager = httpClient.cookieHandler().orElse(null) as? CookieManager ?: return ""
-        return cookieManager.cookieStore.cookies
+    private fun cookieStoreHeader(host: String?): String {
+        val cookieManager = activeCookieManager() ?: return ""
+        val removedNames = removedCookieNames()
+        val candidates = cookieManager.cookieStore.cookies
             .asSequence()
             .filterNot { it.hasExpired() }
-            .filter { it.name.isNotBlank() }
-            .joinToString("; ") { cookie -> "${cookie.name}=${cookie.value}" }
+            .filter { it.name.isNotBlank() && it.name !in removedNames }
+            // 同名 cookie 可能同时来自 `.weibo.com` 与 `.sina.com.cn`（SUB/SUBP 等）。
+            // 排序后再去重，让“取哪一条”由域名匹配度决定，而不是 CookieStore 的迭代顺序。
+            .sortedWith(
+                compareBy<HttpCookie> { it.name }
+                    .thenByDescending { domainAffinity(it, host) }
+                    .thenBy { it.domain.orEmpty() },
+            )
+            .toList()
+        val selected = LinkedHashMap<String, HttpCookie>()
+        candidates.forEach { cookie -> selected.putIfAbsent(cookie.name, cookie) }
+        return selected.entries.joinToString("; ") { (name, cookie) -> "$name=${cookie.value}" }
+    }
+
+    private fun domainAffinity(cookie: HttpCookie, host: String?): Int {
+        val domain = cookie.domain?.trim()?.removePrefix(".")?.lowercase()?.takeIf(String::isNotBlank) ?: return 0
+        val normalizedHost = host?.trim()?.removePrefix(".")?.lowercase()?.takeIf(String::isNotBlank) ?: return 0
+        return when {
+            normalizedHost == domain -> 3
+            normalizedHost.endsWith(".$domain") -> 2
+            else -> 1
+        }
+    }
+
+    private fun activeCookieManager(): CookieManager? {
+        return when (val handler = httpClient.cookieHandler().orElse(null)) {
+            is WeiboCookieJar -> handler.cookieManager
+            is CookieManager -> handler
+            else -> null
+        }
+    }
+
+    private fun removedCookieNames(): Set<String> {
+        return (httpClient.cookieHandler().orElse(null) as? WeiboCookieJar)?.removedCookieNames.orEmpty()
+    }
+
+    private fun String.withoutCookies(names: Set<String>): String {
+        return split(';')
+            .mapNotNull { raw ->
+                val index = raw.indexOf('=')
+                if (index <= 0) return@mapNotNull null
+                val name = raw.substring(0, index).trim()
+                if (name.isBlank() || name in names) return@mapNotNull null
+                "$name=${raw.substring(index + 1).trim()}"
+            }
+            .joinToString("; ")
     }
 
     private fun mergeCookieHeaders(vararg headers: String?): String {
@@ -1697,21 +1827,9 @@ internal class WeiboClient(
         private val WEIBO_TIME_FORMATTER: DateTimeFormatter =
             DateTimeFormatter.ofPattern("EEE MMM dd HH:mm:ss Z yyyy", Locale.ENGLISH)
 
-        private fun defaultHttpClient(cookie: String): HttpClient {
-            val cookieManager = CookieManager(null, CookiePolicy.ACCEPT_ALL)
-            cookie.split(';')
-                .mapNotNull { raw ->
-                    raw.trim()
-                        .takeIf(String::isNotBlank)
-                        ?.let { runCatching { HttpCookie.parse(it).firstOrNull() }.getOrNull() }
-                }
-                .forEach { parsed ->
-                    parsed.domain = ".weibo.com"
-                    parsed.path = "/"
-                    cookieManager.cookieStore.add(URI.create(WEIBO_HOME), parsed)
-                }
+        private fun defaultHttpClient(): HttpClient {
             return HttpClient.newBuilder()
-                .cookieHandler(cookieManager)
+                .cookieHandler(WeiboCookieJar())
                 .followRedirects(HttpClient.Redirect.NORMAL)
                 .connectTimeout(Duration.ofSeconds(10))
                 .build()
