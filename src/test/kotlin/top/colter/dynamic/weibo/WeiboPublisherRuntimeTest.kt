@@ -221,6 +221,171 @@ class WeiboPublisherRuntimeTest {
     }
 
     @Test
+    fun `session keepalive runs even when polling disabled`() = runBlocking {
+        val gateway = RecordingWeiboGateway(exportedCookie = "SUB=renewed")
+        val scheduler = ManualTaskScheduler()
+        var savedConfig: WeiboPublisherConfig? = null
+        val runtime = WeiboPublisherRuntime(
+            loadConfig = { WeiboPublisherConfig(pollingEnabled = false, cookie = "SUB=old") },
+            gatewayFactory = { gateway },
+            cursorStoreFactory = { InMemoryWeiboCursorStore() },
+            saveConfig = { _, config -> savedConfig = config },
+            taskScheduler = scheduler,
+        )
+        runtime.onLoad(testContext(RecordingSourceUpdatePublisher(), FixedSubscriptionQueryService(emptyList())))
+
+        runtime.onStart()
+
+        assertTrue(scheduler.isRunning("weibo-session-keepalive"))
+        assertFalse(scheduler.isRunning("weibo-detect"))
+
+        scheduler.runOnce("weibo-session-keepalive")
+
+        assertEquals(1, gateway.loginCheckCount)
+        assertEquals("SUB=renewed", savedConfig?.cookie)
+    }
+
+    @Test
+    fun `session keepalive restarts detection task stalled by startup login failure`() = runBlocking {
+        val gateway = RecordingWeiboGateway(
+            loginResults = listOf(
+                PublisherLoginResult(PublisherLoginStatus.FAILED, "Cookie 已失效"),
+                PublisherLoginResult(PublisherLoginStatus.SUCCESS, "微博登录状态可用"),
+            ),
+            refreshLoginResult = PublisherLoginResult(PublisherLoginStatus.FAILED, "微博会话恢复缺少 SRF Cookie"),
+        )
+        val scheduler = ManualTaskScheduler()
+        val runtime = WeiboPublisherRuntime(
+            loadConfig = { WeiboPublisherConfig(pollingEnabled = true, cookie = "SUB=expired") },
+            gatewayFactory = { gateway },
+            cursorStoreFactory = { InMemoryWeiboCursorStore() },
+            taskScheduler = scheduler,
+        )
+        runtime.onLoad(testContext(RecordingSourceUpdatePublisher(), FixedSubscriptionQueryService(emptyList())))
+
+        runtime.onStart()
+
+        // 启动时登录校验失败 → 检测任务不启动（这是原有的设计，避免带病轮询）
+        assertFalse(scheduler.isRunning("weibo-detect"))
+
+        scheduler.runOnce("weibo-session-keepalive")
+
+        // 保活恢复登录后应把检测任务补起来，避免永久停摆
+        assertTrue(scheduler.isRunning("weibo-detect"))
+    }
+
+    @Test
+    fun `session keepalive skips when login was validated recently`() = runBlocking {
+        val gateway = RecordingWeiboGateway()
+        val scheduler = ManualTaskScheduler()
+        val runtime = WeiboPublisherRuntime(
+            loadConfig = { WeiboPublisherConfig(pollingEnabled = true, cookie = "SUB=valid") },
+            gatewayFactory = { gateway },
+            cursorStoreFactory = { InMemoryWeiboCursorStore() },
+            taskScheduler = scheduler,
+        )
+        runtime.onLoad(testContext(RecordingSourceUpdatePublisher(), FixedSubscriptionQueryService(emptyList())))
+        runtime.onStart()
+        assertEquals(1, gateway.loginCheckCount)
+
+        scheduler.runOnce("weibo-session-keepalive")
+
+        // 启动校验刚成功，6 小时内不应重复访问首页
+        assertEquals(1, gateway.loginCheckCount)
+    }
+
+    @Test
+    fun `session keepalive failure attempts session restore`() = runBlocking {
+        val gateway = RecordingWeiboGateway(
+            loginResult = PublisherLoginResult(PublisherLoginStatus.FAILED, "Cookie 已失效"),
+            refreshLoginResult = PublisherLoginResult(
+                PublisherLoginStatus.FAILED,
+                "微博会话恢复缺少 SRF Cookie",
+            ),
+        )
+        val scheduler = ManualTaskScheduler()
+        val runtime = WeiboPublisherRuntime(
+            loadConfig = { WeiboPublisherConfig(pollingEnabled = false, cookie = "SUB=expired") },
+            gatewayFactory = { gateway },
+            cursorStoreFactory = { InMemoryWeiboCursorStore() },
+            taskScheduler = scheduler,
+        )
+        runtime.onLoad(testContext(RecordingSourceUpdatePublisher(), FixedSubscriptionQueryService(emptyList())))
+        runtime.onStart()
+
+        scheduler.runOnce("weibo-session-keepalive")
+
+        assertEquals(1, gateway.loginCheckCount)
+        assertEquals(1, gateway.refreshLoginCount)
+    }
+
+    @Test
+    fun `manual login check clears paused polling`() = runBlocking {
+        val gateway = object : RecordingWeiboGateway(
+            posts = listOf(testPost("post-1", "10001", 2_000)),
+            loginResults = listOf(
+                PublisherLoginResult(PublisherLoginStatus.SUCCESS, "微博登录状态可用"),
+                PublisherLoginResult(PublisherLoginStatus.FAILED, "Cookie 已失效"),
+            ),
+            refreshLoginResult = PublisherLoginResult(
+                PublisherLoginStatus.FAILED,
+                "微博会话恢复缺少 SRF Cookie",
+            ),
+        ) {
+            var timelineAvailable: Boolean = false
+
+            override suspend fun fetchFollowTimeline(sinceEpochSeconds: Long?): WeiboTimelinePage {
+                if (!timelineAvailable) throw WeiboLoginException("Cookie 已失效")
+                return super.fetchFollowTimeline(sinceEpochSeconds)
+            }
+        }
+        val scheduler = ManualTaskScheduler()
+        val updates = RecordingSourceUpdatePublisher()
+        val cursors = InMemoryWeiboCursorStore(
+            mapOf(
+                1 to SourceCursor(
+                    publisherId = 1,
+                    sourceKey = WEIBO_DYNAMIC_FEED_KEY,
+                    eventType = SourceEventType.DYNAMIC_CREATED,
+                    lastSeenUpdateKey = "old",
+                    lastSeenAtEpochSeconds = 1,
+                ),
+            ),
+        )
+        val runtime = WeiboPublisherRuntime(
+            loadConfig = {
+                WeiboPublisherConfig(
+                    pollingEnabled = true,
+                    replayWindowMinutes = 0,
+                    maxConsecutiveLoginFailures = 1,
+                    cookie = "SUB=expired",
+                )
+            },
+            gatewayFactory = { gateway },
+            cursorStoreFactory = { cursors },
+            taskScheduler = scheduler,
+        )
+        runtime.onLoad(
+            testContext(updates, FixedSubscriptionQueryService(listOf(testPublisher(1, "10001")))),
+        )
+        runtime.onStart()
+
+        // 第一轮：关注流判定未登录，阈值 1 → 暂停轮询
+        scheduler.runOnce("weibo-detect")
+        assertEquals(0, updates.requests.size)
+
+        // 恢复前再跑一轮：进入 12 小时限流，依旧拿不到数据
+        gateway.timelineAvailable = true
+        scheduler.runOnce("weibo-detect")
+        assertEquals(0, updates.requests.size)
+
+        // 后台点“刷新” → 登录状态检查成功，应解除暂停并让下一轮恢复检测
+        assertEquals(PublisherLoginStatus.SUCCESS, runtime.checkLoginState().status)
+        scheduler.runOnce("weibo-detect")
+        assertEquals(1, updates.requests.size)
+    }
+
+    @Test
     fun `startup replay uses friend timeline and persists runtime cookie`() = runBlocking {
         val now = System.currentTimeMillis() / 1000
         val publisher = testPublisher(id = 1, userId = "10001")

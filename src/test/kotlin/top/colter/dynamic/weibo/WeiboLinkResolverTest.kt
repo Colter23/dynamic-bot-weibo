@@ -9,8 +9,11 @@ import top.colter.dynamic.core.data.PublisherKey
 import top.colter.dynamic.core.data.PublisherKind
 import top.colter.dynamic.core.link.LinkKinds
 import top.colter.dynamic.core.link.LinkResolution
+import top.colter.dynamic.core.plugin.PublisherLoginResult
+import top.colter.dynamic.core.plugin.PublisherLoginStatus
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -119,6 +122,108 @@ class WeiboLinkResolverTest {
         assertEquals("5977716744", resolution.preview.publisher?.externalId)
     }
 
+    @Test
+    fun `renews session and retries when detail lookup returns null`() = runBlocking {
+        val gateway = FlakyGateway(post)
+        var renewCount = 0
+        val flakyResolver = WeiboLinkResolver(
+            platformId = platformId,
+            gatewayProvider = { gateway },
+            mapper = WeiboDynamicMapper(),
+            publisherInfoResolver = { publisher },
+            sessionRenewer = {
+                renewCount += 1
+                PublisherLoginResult(PublisherLoginStatus.SUCCESS, "微博登录状态可用")
+            },
+        )
+        val parsed = assertNotNull(flakyResolver.parseLink("https://weibo.com/detail/R1CXrAEh5"))
+
+        val resolution = flakyResolver.resolveLink(parsed)
+
+        assertTrue(resolution is LinkResolution.Dynamic)
+        assertEquals(1, renewCount)
+        assertEquals(2, gateway.postDetailCalls)
+    }
+
+    @Test
+    fun `reports login expired instead of missing post when renewal fails`() = runBlocking {
+        val gateway = FlakyGateway(post, alwaysNull = true)
+        val flakyResolver = WeiboLinkResolver(
+            platformId = platformId,
+            gatewayProvider = { gateway },
+            mapper = WeiboDynamicMapper(),
+            publisherInfoResolver = { publisher },
+            sessionRenewer = { PublisherLoginResult(PublisherLoginStatus.FAILED, "Cookie 已失效") },
+        )
+        val parsed = assertNotNull(flakyResolver.parseLink("https://weibo.com/detail/R1CXrAEh5"))
+
+        val resolution = flakyResolver.resolveLink(parsed)
+
+        assertTrue(resolution is LinkResolution.Failed)
+        assertTrue(resolution.reason.contains("登录状态已失效"))
+    }
+
+    @Test
+    fun `keeps missing post reason when post really absent`() = runBlocking {
+        val gateway = FlakyGateway(post, alwaysNull = true)
+        val flakyResolver = WeiboLinkResolver(
+            platformId = platformId,
+            gatewayProvider = { gateway },
+            mapper = WeiboDynamicMapper(),
+            publisherInfoResolver = { publisher },
+            sessionRenewer = { PublisherLoginResult(PublisherLoginStatus.SUCCESS, "微博登录状态可用") },
+        )
+        val parsed = assertNotNull(flakyResolver.parseLink("https://weibo.com/detail/R1CXrAEh5"))
+
+        val resolution = flakyResolver.resolveLink(parsed)
+
+        assertTrue(resolution is LinkResolution.Failed)
+        assertTrue(resolution.reason.contains("未找到微博动态"))
+    }
+
+    @Test
+    fun `failed renewal is counted as login failure`() = runBlocking {
+        val gateway = FlakyGateway(post, alwaysNull = true)
+        val handler = WeiboRequestFailureHandler(
+            configProvider = { WeiboPublisherConfig(maxConsecutiveLoginFailures = 1) },
+        )
+        val flakyResolver = WeiboLinkResolver(
+            platformId = platformId,
+            gatewayProvider = { gateway },
+            mapper = WeiboDynamicMapper(),
+            publisherInfoResolver = { publisher },
+            requestFailureHandler = handler,
+            sessionRenewer = { PublisherLoginResult(PublisherLoginStatus.FAILED, "Cookie 已失效") },
+        )
+        val parsed = assertNotNull(flakyResolver.parseLink("https://weibo.com/detail/R1CXrAEh5"))
+
+        flakyResolver.resolveLink(parsed)
+
+        assertTrue(handler.isPollingPaused())
+    }
+
+    @Test
+    fun `missing post does not count as login failure`() = runBlocking {
+        val gateway = FlakyGateway(post, alwaysNull = true)
+        val handler = WeiboRequestFailureHandler(
+            configProvider = { WeiboPublisherConfig(maxConsecutiveLoginFailures = 1) },
+        )
+        val flakyResolver = WeiboLinkResolver(
+            platformId = platformId,
+            gatewayProvider = { gateway },
+            mapper = WeiboDynamicMapper(),
+            publisherInfoResolver = { publisher },
+            requestFailureHandler = handler,
+            sessionRenewer = { PublisherLoginResult(PublisherLoginStatus.SUCCESS, "微博登录状态可用") },
+        )
+        val parsed = assertNotNull(flakyResolver.parseLink("https://weibo.com/detail/R1CXrAEh5"))
+
+        val resolution = flakyResolver.resolveLink(parsed)
+
+        assertTrue(resolution is LinkResolution.Failed)
+        assertFalse(handler.isPollingPaused())
+    }
+
     private class FakeGateway(
         private val post: WeiboPostSnapshot?,
     ) : WeiboGateway {
@@ -126,6 +231,24 @@ class WeiboLinkResolverTest {
 
         override suspend fun fetchPostDetail(postId: String): WeiboPostSnapshot? {
             return post?.takeIf { it.postId == postId }
+        }
+    }
+
+    private class FlakyGateway(
+        private val post: WeiboPostSnapshot,
+        private val alwaysNull: Boolean = false,
+    ) : WeiboGateway {
+        var postDetailCalls: Int = 0
+            private set
+
+        override suspend fun fetchPublisherSnapshot(userId: String): WeiboPublisherSnapshot? = null
+
+        override suspend fun fetchPostDetail(postId: String): WeiboPostSnapshot? {
+            postDetailCalls += 1
+            if (alwaysNull) return null
+            // 首次模拟会话失效（接口 2xx 但解析不出动态），续期后第二次返回正常数据。
+            if (postDetailCalls == 1) return null
+            return post.takeIf { it.postId == postId }
         }
     }
 }

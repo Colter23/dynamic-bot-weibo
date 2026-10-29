@@ -42,6 +42,25 @@ internal class WeiboRequestFailureHandler(
         }
     }
 
+    /**
+     * 与 [run] 相同地记录失败，但成功时不重置登录失败计数。
+     *
+     * 用于“请求成功但结果为空”也算可疑的调用方（例如微博详情解析：接口返回 2xx 却没有动态字段，
+     * 常见原因是登录会话失效）。这类调用由调用方自己决定成功语义，避免空结果把连续未登录计数清零。
+     */
+    suspend fun <T> runSilently(
+        operation: String,
+        block: suspend () -> T,
+    ): Result<T> {
+        return try {
+            Result.success(block())
+        } catch (error: Throwable) {
+            // recordFailure 内部会重新抛出 CancellationException，保持取消语义。
+            recordFailure(operation, error)
+            Result.failure(error)
+        }
+    }
+
     suspend fun recordSuccess(operation: String) {
         val wasPaused = pollingPausedByLoginFailure
         if (consecutiveLoginFailures > 0 || pollingPausedByLoginFailure) {

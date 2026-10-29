@@ -47,6 +47,7 @@ import top.colter.dynamic.core.task.TaskSchedule
 import top.colter.dynamic.core.task.TaskScheduler
 import top.colter.dynamic.core.tools.loggerFor
 import kotlin.math.roundToLong
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 internal const val WEIBO_PLATFORM_ID: String = "weibo"
@@ -68,6 +69,7 @@ internal class WeiboPublisherRuntime() :
 
     private var pluginId: String = DEFAULT_PLUGIN_ID
     private val detectTaskId: String = "weibo-detect"
+    private val keepaliveTaskId: String = "weibo-session-keepalive"
 
     override val platformId: PlatformId = PlatformId.of(WEIBO_PLATFORM_ID)
 
@@ -109,6 +111,7 @@ internal class WeiboPublisherRuntime() :
     private lateinit var requestFailureHandler: WeiboRequestFailureHandler
     private lateinit var cursorStore: WeiboCursorStore
     private lateinit var detectTask: TaskDefinition
+    private lateinit var keepaliveTask: TaskDefinition
 
     private val detectMutex: Mutex = Mutex()
     private val loginMutex: Mutex = Mutex()
@@ -183,6 +186,7 @@ internal class WeiboPublisherRuntime() :
             mapper = mapper,
             publisherInfoResolver = ::fetchPublisherInfo,
             requestFailureHandler = requestFailureHandler,
+            sessionRenewer = { checkLoginState() },
         )
         cursorStore = cursorStoreFactory()
         detectTask = TaskDefinition(
@@ -192,13 +196,25 @@ internal class WeiboPublisherRuntime() :
             schedule = TaskSchedule.FixedDelay(config.pollingIntervalSeconds.seconds, runImmediately = true),
             action = { detectAndPublish() },
         )
+        keepaliveTask = TaskDefinition(
+            id = keepaliveTaskId,
+            name = "微博会话保活",
+            description = "定期访问微博首页续期登录会话，避免链接解析在会话过期后失效。",
+            schedule = TaskSchedule.FixedDelay(
+                SESSION_KEEPALIVE_INTERVAL_MILLIS.milliseconds,
+                runImmediately = true,
+            ),
+            action = { ensureSessionAlive() },
+        )
         loadActivePublishers()
         logger.info { "微博插件已加载：pluginId=$pluginId，轮询启用=${config.pollingEnabled}" }
     }
 
     override suspend fun onStart() {
+        // 会话保活与轮询无关：即使没有订阅、只用链接解析，也需要定期续期微博登录会话。
+        startSessionKeepaliveTask()
         if (!config.pollingEnabled) {
-            logger.info { "微博轮询未启用；可在配置中开启后按间隔检测订阅动态" }
+            logger.info { "微博轮询未启用；链接解析依赖会话保活任务维持登录状态" }
             return
         }
         val initialLoginResult = checkLoginState()
@@ -223,6 +239,7 @@ internal class WeiboPublisherRuntime() :
     override suspend fun onStop() {
         if (::taskScheduler.isInitialized) {
             taskScheduler.stop(detectTaskId)
+            taskScheduler.stop(keepaliveTaskId)
         }
         runCatching { persistRuntimeCookieIfChanged() }
             .onFailure {
@@ -318,7 +335,8 @@ internal class WeiboPublisherRuntime() :
 
     override suspend fun checkLoginState(): PublisherLoginResult {
         val result = try {
-            gateway.checkLoginState()
+            // 会话保活任务、检测任务和后台刷新可能同时触发检查；用同一把登录锁避免并发访问首页与并发回存配置。
+            loginMutex.withLock { gateway.checkLoginState() }
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
@@ -329,6 +347,11 @@ internal class WeiboPublisherRuntime() :
         }
         if (result.status == PublisherLoginStatus.SUCCESS) {
             lastLoginValidationAtMillis = System.currentTimeMillis()
+            // 手动刷新或连接解析触发的检查成功后，应同时解除“连续未登录暂停”，否则会出现
+            // 后台显示已登录、轮询却仍被暂停的情况。
+            if (::requestFailureHandler.isInitialized) {
+                requestFailureHandler.recordSuccess("微博登录状态检查")
+            }
             persistRuntimeCookieIfChanged()
         }
         return result
@@ -899,6 +922,56 @@ internal class WeiboPublisherRuntime() :
         return started
     }
 
+    private fun startSessionKeepaliveTask(): Boolean {
+        val started = taskScheduler.start(keepaliveTask)
+        if (started) {
+            logger.info {
+                "微博会话保活任务已启动：taskId=$keepaliveTaskId，间隔=${SESSION_KEEPALIVE_INTERVAL_MILLIS / 3_600_000L} 小时"
+            }
+        } else {
+            logger.debug { "微博会话保活任务已在运行：taskId=$keepaliveTaskId" }
+        }
+        return started
+    }
+
+    /**
+     * 定期访问微博首页续期登录会话。
+     *
+     * 微博的登录会话不会因为读取动态/资料接口而续期，只有访问 PC 首页才会下发新的 `Set-Cookie`。
+     * 过去这一步只在轮询里做，导致“没有订阅、只做链接解析”的部署永远不会续期，几天后解析全部失效，
+     * 必须到后台手动点一次刷新才能恢复。这里把它独立成任务，与轮询开关无关。
+     */
+    private suspend fun ensureSessionAlive() {
+        val now = System.currentTimeMillis()
+        if (now - lastLoginValidationAtMillis < SESSION_KEEPALIVE_INTERVAL_MILLIS) {
+            logger.debug { "微博会话保活跳过：近期已完成登录状态校验" }
+            return
+        }
+
+        val initialResult = checkLoginState()
+        val result = if (initialResult.status == PublisherLoginStatus.SUCCESS) {
+            initialResult
+        } else {
+            restoreLoginSession(initialResult)
+        }
+        if (result.status == PublisherLoginStatus.SUCCESS) {
+            requestFailureHandler.recordSuccess("微博会话保活")
+            logger.info {
+                "微博会话保活完成：账号=${result.account?.name ?: result.account?.userId ?: "未知"}"
+            }
+            // 启动时登录校验失败会让检测任务停在“未启动”状态，保活恢复后把它补上，避免永久停摆。
+            if (config.pollingEnabled && ::taskScheduler.isInitialized && !taskScheduler.isRunning(detectTaskId)) {
+                bootstrapLoggedInState(allowReplay = true)
+            }
+            return
+        }
+        logger.warn { "微博会话保活失败：${result.message}" }
+        requestFailureHandler.recordFailure(
+            operation = "微博会话保活",
+            error = WeiboLoginException(result.message),
+        )
+    }
+
     private fun markSeenMonotonic(
         publisherId: Int,
         cursor: SourceCursor,
@@ -993,6 +1066,9 @@ internal class WeiboPublisherRuntime() :
     private companion object {
         private const val SECONDS_PER_MINUTE: Long = 60L
         private const val LOGIN_VALIDATION_INTERVAL_MILLIS: Long = 12 * 60 * 60 * 1_000L
+
+        /** 会话保活间隔；与轮询无关，纯链接解析的部署也依赖它续期登录会话。 */
+        private const val SESSION_KEEPALIVE_INTERVAL_MILLIS: Long = 6 * 60 * 60 * 1_000L
     }
 }
 
