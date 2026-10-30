@@ -1,12 +1,17 @@
 package top.colter.dynamic.weibo
 
 import kotlinx.coroutines.runBlocking
+import top.colter.dynamic.core.data.DynamicContentNodeText
+import top.colter.dynamic.core.data.DynamicMediaCardKind
+import top.colter.dynamic.core.data.DynamicPayload
+import top.colter.dynamic.core.data.MediaCardBlock
 import top.colter.dynamic.core.data.MediaKind
 import top.colter.dynamic.core.data.MediaRef
 import top.colter.dynamic.core.data.PlatformId
 import top.colter.dynamic.core.data.PublisherInfo
 import top.colter.dynamic.core.data.PublisherKey
 import top.colter.dynamic.core.data.PublisherKind
+import top.colter.dynamic.core.data.TextBlock
 import top.colter.dynamic.core.link.LinkKinds
 import top.colter.dynamic.core.link.LinkResolution
 import top.colter.dynamic.core.plugin.PublisherLoginResult
@@ -81,7 +86,7 @@ class WeiboLinkResolverTest {
     }
 
     @Test
-    fun `resolve video dynamic link as video preview`() = runBlocking {
+    fun `resolve video dynamic link keeps body text and video card`() = runBlocking {
         val videoPost = post.copy(
             card = WeiboMediaCardSnapshot(
                 kind = WeiboMediaCardKind.VIDEO,
@@ -103,11 +108,23 @@ class WeiboLinkResolverTest {
 
         val resolution = videoResolver.resolveLink(parsed)
 
-        assertTrue(resolution is LinkResolution.Preview)
-        assertEquals(LinkKinds.DYNAMIC, resolution.parsedLink.kind)
-        assertEquals(LinkKinds.VIDEO, resolution.preview.kind)
-        assertEquals("测试视频", resolution.preview.title)
-        assertEquals(90, resolution.preview.durationSeconds)
+        // 带视频的动态仍然是动态：正文必须以正文块渲染，而不是被塞进视频卡片的描述里
+        assertTrue(resolution is LinkResolution.Dynamic)
+        val payload = resolution.update.payload as DynamicPayload
+        val blocks = payload.blocks
+
+        val textBlock = blocks.first() as TextBlock
+        val body = textBlock.content.nodes
+            .filterIsInstance<DynamicContentNodeText>()
+            .joinToString("") { it.text }
+        assertTrue(body.contains("一条微博"))
+
+        val card = blocks.filterIsInstance<MediaCardBlock>().single()
+        assertEquals(DynamicMediaCardKind.VIDEO, card.card.kind)
+        assertEquals("测试视频", card.card.title)
+        assertEquals("视频简介", card.card.description)
+        assertEquals(90, card.card.durationSeconds)
+        assertEquals("https://example.com/video.mp4", card.card.mediaUri)
     }
 
     @Test
