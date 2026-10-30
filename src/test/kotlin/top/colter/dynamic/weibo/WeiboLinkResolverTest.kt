@@ -20,6 +20,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class WeiboLinkResolverTest {
@@ -83,6 +84,8 @@ class WeiboLinkResolverTest {
         assertTrue(resolution is LinkResolution.Dynamic)
         assertEquals("R1CXrAEh5", resolution.update.key.externalId)
         assertEquals("5977716744", resolution.update.publisher.externalId)
+        // 没有视频的帖子不应附带可下载视频
+        assertNull(resolution.attachedVideo)
     }
 
     @Test
@@ -125,6 +128,15 @@ class WeiboLinkResolverTest {
         assertEquals("视频简介", card.card.description)
         assertEquals(90, card.card.durationSeconds)
         assertEquals("https://example.com/video.mp4", card.card.mediaUri)
+
+        // 附带视频只服务于按模板补发视频：不写正文，携带时长与封面
+        val attachedVideo = assertNotNull(resolution.attachedVideo)
+        assertEquals(LinkKinds.VIDEO, attachedVideo.kind)
+        assertEquals("R1CXrAEh5", attachedVideo.id)
+        assertEquals("测试视频", attachedVideo.title)
+        assertEquals("视频简介", attachedVideo.description)
+        assertEquals(90, attachedVideo.durationSeconds)
+        assertEquals("https://example.com/cover.jpg", attachedVideo.cover?.uri)
     }
 
     @Test
