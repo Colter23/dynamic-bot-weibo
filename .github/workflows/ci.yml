@@ -73,6 +73,10 @@ jobs:
           name: dynamic-bot-weibo
           path: release
 
+      - name: Export plugin descriptor
+        shell: bash
+        run: unzip -p release/*-all.jar plugin.yml > release/plugin.yml
+
       - name: Generate SHA-256 checksum
         shell: bash
         run: |
@@ -101,5 +105,6 @@ jobs:
           files: |
             release/*-all.jar
             release/*-all.jar.sha256
+            release/plugin.yml
           fail_on_unmatched_files: true
           generate_release_notes: true
