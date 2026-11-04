@@ -164,6 +164,7 @@ class WeiboLinkResolverTest {
                 renewCount += 1
                 PublisherLoginResult(PublisherLoginStatus.SUCCESS, "微博登录状态可用")
             },
+            sessionRevision = { renewCount.toLong() },
         )
         val parsed = assertNotNull(flakyResolver.parseLink("https://weibo.com/detail/R1CXrAEh5"))
 
@@ -208,6 +209,7 @@ class WeiboLinkResolverTest {
 
         assertTrue(resolution is LinkResolution.Failed)
         assertTrue(resolution.reason.contains("未找到微博动态"))
+        assertEquals(1, gateway.postDetailCalls)
     }
 
     @Test

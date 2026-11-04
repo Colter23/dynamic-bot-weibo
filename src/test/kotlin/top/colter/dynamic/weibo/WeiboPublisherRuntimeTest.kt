@@ -95,7 +95,7 @@ class WeiboPublisherRuntimeTest {
     }
 
     @Test
-    fun `startup login check failure does not pause polling or notify administrators`() = runBlocking {
+    fun `startup login failure leaves detection stopped and reports missing renewal credentials`() = runBlocking {
         val gateway = RecordingWeiboGateway(
             loginResult = PublisherLoginResult(
                 status = PublisherLoginStatus.FAILED,
@@ -134,7 +134,7 @@ class WeiboPublisherRuntimeTest {
 
         assertFalse(scheduler.isRunning("weibo-detect"))
         assertEquals(4, gateway.loginCheckCount)
-        assertEquals(emptyList(), notifications)
+        assertEquals(listOf("weibo.session_refresh_failed"), notifications.map { it.type }.distinct())
     }
 
     @Test
@@ -216,8 +216,8 @@ class WeiboPublisherRuntimeTest {
         scheduler.runOnce("weibo-detect")
         scheduler.runOnce("weibo-detect")
 
-        assertEquals(1, gateway.refreshLoginCount)
-        assertTrue(notifications.any { it.type == "weibo.login_recovered" })
+        assertEquals(2, gateway.refreshLoginCount)
+        assertTrue(scheduler.isRunning("weibo-detect"))
     }
 
     @Test
@@ -270,6 +270,8 @@ class WeiboPublisherRuntimeTest {
 
         scheduler.runOnce("weibo-session-keepalive")
 
+        runtime.checkLoginState()
+
         // 保活恢复登录后应把检测任务补起来，避免永久停摆
         assertTrue(scheduler.isRunning("weibo-detect"))
     }
@@ -316,7 +318,7 @@ class WeiboPublisherRuntimeTest {
         scheduler.runOnce("weibo-session-keepalive")
 
         assertEquals(1, gateway.loginCheckCount)
-        assertEquals(1, gateway.refreshLoginCount)
+        assertEquals(0, gateway.refreshLoginCount)
     }
 
     @Test
@@ -325,7 +327,6 @@ class WeiboPublisherRuntimeTest {
             posts = listOf(testPost("post-1", "10001", 2_000)),
             loginResults = listOf(
                 PublisherLoginResult(PublisherLoginStatus.SUCCESS, "微博登录状态可用"),
-                PublisherLoginResult(PublisherLoginStatus.FAILED, "Cookie 已失效"),
             ),
             refreshLoginResult = PublisherLoginResult(
                 PublisherLoginStatus.FAILED,
@@ -374,7 +375,7 @@ class WeiboPublisherRuntimeTest {
         scheduler.runOnce("weibo-detect")
         assertEquals(0, updates.requests.size)
 
-        // 恢复前再跑一轮：进入 12 小时限流，依旧拿不到数据
+        // 自动轮询保持暂停，后台显式检查可以确认用户已恢复的会话。
         gateway.timelineAvailable = true
         scheduler.runOnce("weibo-detect")
         assertEquals(0, updates.requests.size)
@@ -850,7 +851,7 @@ class WeiboPublisherRuntimeTest {
     private open class RecordingWeiboGateway(
         private val posts: List<WeiboPostSnapshot> = emptyList(),
         private val followTimelinePages: List<WeiboTimelinePage> = emptyList(),
-        private val exportedCookie: String = "",
+        private val exportedCookie: String = "SUB=test",
         private val loginResult: PublisherLoginResult = PublisherLoginResult(PublisherLoginStatus.SUCCESS, "登录成功"),
         private val loginResults: List<PublisherLoginResult> = emptyList(),
         private val qrChallenge: PublisherQrLoginChallenge? = null,
@@ -872,7 +873,7 @@ class WeiboPublisherRuntimeTest {
 
         override fun exportCookie(): String = exportedCookie
 
-        override suspend fun checkLoginState(): PublisherLoginResult {
+        override suspend fun checkLoginState(expectedUserId: String?): PublisherLoginResult {
             loginCheckCount += 1
             return loginResults.getOrNull(loginCheckCount - 1) ?: loginResult
         }
@@ -887,7 +888,9 @@ class WeiboPublisherRuntimeTest {
             return qrLoginResult
         }
 
-        override suspend fun refreshLoginSession(): PublisherLoginResult {
+        override fun canRefreshSession(): Boolean = refreshLoginResult.status == PublisherLoginStatus.SUCCESS
+
+        override suspend fun refreshLoginSession(expectedUserId: String?): PublisherLoginResult {
             refreshLoginCount += 1
             return refreshLoginResult
         }

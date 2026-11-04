@@ -23,16 +23,12 @@ internal class WeiboLinkResolver(
     private val mapper: WeiboDynamicMapper,
     private val publisherInfoResolver: suspend (String) -> PublisherInfo?,
     private val requestFailureHandler: WeiboRequestFailureHandler? = null,
-    private val sessionRenewer: (suspend () -> PublisherLoginResult)? = null,
+    private val sessionRenewer: (suspend (Boolean) -> PublisherLoginResult)? = null,
+    private val isLoginExpired: () -> Boolean = { true },
+    private val sessionRevision: () -> Long = { 0 },
 ) {
     private val gateway: WeiboGateway
         get() = gatewayProvider()
-
-    @Volatile
-    private var lastSessionRenewedAtMillis: Long = 0L
-
-    @Volatile
-    private var lastSessionRenewResult: PublisherLoginResult? = null
 
     fun matchesLink(inputUrl: String): Boolean {
         return parseDirectLink(inputUrl.trim().trimUrlPunctuation()) != null
@@ -62,10 +58,6 @@ internal class WeiboLinkResolver(
         val operation = "微博动态详情解析 id=$targetId"
         var attempt = fetchPostDetailResult(targetId)
 
-        // 两种失败都可能是登录会话已失效：
-        // 1) 接口返回 2xx 却解析不出动态字段（客户端只能返回 null）；
-        // 2) 接口明确判定为未登录（WeiboLoginException）。
-        // 此时先续期一次首页会话再重试，避免把“未登录”误报成“动态不存在”。
         val needsRenewal = if (attempt.isSuccess) {
             attempt.getOrNull() == null
         } else {
@@ -73,9 +65,11 @@ internal class WeiboLinkResolver(
         }
         var renewal: SessionRenewal? = null
         if (needsRenewal) {
-            renewal = renewSessionOnce()
-            // 只有本次真的访问过首页（而不是命中冷却）才重试，避免“动态确实不存在”时多打一次详情请求。
-            if (renewal != null && renewal.fresh && renewal.result.status == PublisherLoginStatus.SUCCESS) {
+            val explicitlyExpired = attempt.exceptionOrNull() is WeiboLoginException
+            val previousRevision = sessionRevision()
+            renewal = renewSessionOnce(explicitlyExpired)
+            if (renewal != null && renewal.result.status == PublisherLoginStatus.SUCCESS &&
+                (explicitlyExpired || sessionRevision() != previousRevision)) {
                 attempt = fetchPostDetailResult(targetId)
             }
         }
@@ -85,16 +79,15 @@ internal class WeiboLinkResolver(
             val failure = attempt.exceptionOrNull()
             val renewalState = renewal
             val reason = if (renewalState != null && renewalState.result.status != PublisherLoginStatus.SUCCESS) {
-                // 会话续期也失败：这是登录问题，必须计入未登录失败，而不是当成“动态不存在”。
-                // 请求本身抛异常时 runSilently 已经记过一次，这里不重复计数。
-                if (failure == null) {
+                if (isLoginExpired()) {
                     requestFailureHandler?.recordFailure(
                         operation = operation,
                         error = WeiboLoginException(renewalState.result.message),
                     )
                 }
-                loginExpiredReason(renewalState.result)
+                if (isLoginExpired()) loginExpiredReason(renewalState.result) else renewalState.result.message
             } else if (failure != null) {
+                requestFailureHandler?.recordFailure(operation, failure)
                 resolveFailureReason(failure)
             } else {
                 // 请求本身成功、只是没有这条动态；登录状态是好的。
@@ -258,42 +251,28 @@ internal class WeiboLinkResolver(
     }
 
     private suspend fun fetchPostDetailResult(postId: String): Result<WeiboPostSnapshot?> {
-        val handler = requestFailureHandler
-        return if (handler != null) {
-            // 用 runSilently：空结果不应当被计为“请求成功”，成功语义由 resolveDynamic 判定。
-            handler.runSilently("微博动态详情解析 id=$postId") {
-                gateway.fetchPostDetail(postId)
-            }
-        } else {
-            runCatching { gateway.fetchPostDetail(postId) }
+        return try {
+            Result.success(gateway.fetchPostDetail(postId))
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            Result.failure(error)
         }
     }
 
-    /**
-     * 解析失败时续期一次登录会话（访问微博首页，客户端会接收并更新 Set-Cookie）。
-     * 冷却期内复用上一次结果，避免连续失败时反复请求首页；[SessionRenewal.fresh] 表示本次是否真的发起了续期。
-     */
-    private suspend fun renewSessionOnce(): SessionRenewal? {
+    private suspend fun renewSessionOnce(knownExpired: Boolean): SessionRenewal? {
         val renewer = sessionRenewer ?: return null
-        val now = System.currentTimeMillis()
-        lastSessionRenewResult?.let { cached ->
-            if (now - lastSessionRenewedAtMillis < SESSION_RENEW_COOLDOWN_MILLIS) {
-                return SessionRenewal(cached, fresh = false)
-            }
-        }
         val result = try {
-            renewer()
+            renewer(knownExpired)
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
             PublisherLoginResult(
                 status = PublisherLoginStatus.FAILED,
-                message = error.message ?: "微博登录状态检查失败",
+                message = "微博登录状态检查暂时失败，请稍后重试",
             )
         }
-        lastSessionRenewedAtMillis = System.currentTimeMillis()
-        lastSessionRenewResult = result
-        return SessionRenewal(result, fresh = true)
+        return SessionRenewal(result)
     }
 
     private fun parseFailureReason(targetId: String): String {
@@ -313,7 +292,6 @@ internal class WeiboLinkResolver(
 
     private data class SessionRenewal(
         val result: PublisherLoginResult,
-        val fresh: Boolean,
     )
 
     private fun fallbackPublisher(): Publisher {
@@ -370,6 +348,5 @@ internal class WeiboLinkResolver(
     private companion object {
         private const val WEIBO_HOME: String = "https://weibo.com"
         private const val DEFAULT_WEIBO_AVATAR: String = "https://weibo.com/favicon.ico"
-        private const val SESSION_RENEW_COOLDOWN_MILLIS: Long = 5 * 60 * 1_000L
     }
 }

@@ -128,7 +128,9 @@ internal data class WeiboFollowGroupSnapshot(
 internal interface WeiboGateway {
     fun exportCookie(): String = ""
 
-    suspend fun checkLoginState(): PublisherLoginResult {
+    fun canRefreshSession(): Boolean = WeiboCookieJar(exportCookie()).canRefresh()
+
+    suspend fun checkLoginState(expectedUserId: String? = null): PublisherLoginResult {
         return PublisherLoginResult(
             status = PublisherLoginStatus.UNSUPPORTED,
             message = "不支持微博登录状态检查",
@@ -145,7 +147,7 @@ internal interface WeiboGateway {
         )
     }
 
-    suspend fun refreshLoginSession(): PublisherLoginResult {
+    suspend fun refreshLoginSession(expectedUserId: String? = null): PublisherLoginResult {
         return PublisherLoginResult(
             status = PublisherLoginStatus.UNSUPPORTED,
             message = "不支持微博会话恢复",

@@ -4,6 +4,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -27,11 +30,8 @@ import top.colter.dynamic.core.plugin.PublisherLoginResult
 import top.colter.dynamic.core.plugin.PublisherLoginStatus
 import top.colter.dynamic.core.plugin.PublisherQrLoginChallenge
 import top.colter.dynamic.core.tools.loggerFor
-import java.net.CookieHandler
-import java.net.CookieManager
-import java.net.CookiePolicy
-import java.net.HttpCookie
 import java.net.URI
+import java.net.HttpCookie
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.net.http.HttpClient
@@ -43,9 +43,7 @@ import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
-import java.util.LinkedHashMap
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
 
 private val logger = loggerFor<WeiboClient>()
 
@@ -60,95 +58,20 @@ internal data class WeiboQrLoginPollSnapshot(
     val loginUrl: String? = null,
 )
 
-private data class WeiboSsoToken(
-    val alt: String,
-    val saveState: Int,
-)
-
-/**
- * 微博 Cookie 容器。与直接用 [CookieManager] 有三处刻意差异：
- *
- * 1. 不用配置里的 cookie 预填充 CookieStore。配置值由 [WeiboClient.currentCookieHeader] 作为兜底参与拼接，
- *    服务端实际下发的 cookie 始终排在后面并覆盖同名配置值。预填充会凭空造出 `.weibo.com` 域的条目，
- *    与服务端 host-only 的同名 cookie 在 store 里并存，取值就取决于插入顺序了。
- * 2. [get] 固定返回空，发送时完全由 [WeiboClient] 自己拼接 Cookie 头。否则 JDK 会把 CookieStore 里的内容
- *    再追加一遍，与服务端实际收到的手动头重复，白白放大请求体积。
- * 3. [put] 在交给 CookieStore 之前记录服务端显式删除的 cookie 名。[CookieManager] 只对 `Max-Age=0`
- *    真正删除条目；`Expires` 已过期时只会新增一条过期 cookie，旧值仍留在 store 里。记录删除名可以同时
- *    清掉 store 残留和配置兜底，并在服务端重新设置同名 cookie 时自动解除。
- */
-internal class WeiboCookieJar : CookieHandler() {
-    private val manager: CookieManager = CookieManager(null, CookiePolicy.ACCEPT_ALL)
-    private val removedNames: MutableSet<String> = ConcurrentHashMap.newKeySet()
-
-    val cookieManager: CookieManager
-        get() = manager
-
-    val removedCookieNames: Set<String>
-        get() = removedNames
-
-    override fun get(uri: URI, requestHeaders: Map<String, List<String>>): Map<String, List<String>> {
-        return emptyMap()
-    }
-
-    override fun put(uri: URI, responseHeaders: Map<String, List<String>>) {
-        recordRemovedCookies(uri, responseHeaders)
-        manager.put(uri, responseHeaders)
-    }
-
-    private fun recordRemovedCookies(uri: URI, responseHeaders: Map<String, List<String>>) {
-        responseHeaders.forEach headerLoop@{ (headerName, values) ->
-            if (!headerName.equals(SET_COOKIE_HEADER, ignoreCase = true) &&
-                !headerName.equals(SET_COOKIE2_HEADER, ignoreCase = true)
-            ) {
-                return@headerLoop
-            }
-            values.forEach { value ->
-                runCatching { HttpCookie.parse(value) }
-                    .getOrDefault(emptyList())
-                    .filter { it.name.isNotBlank() }
-                    .forEach { cookie ->
-                        // 只追踪微博主域的会话 cookie：`passport.weibo.com`、`login.sina.com.cn` 上存在
-                        // 同名的 SUB/SUBP，那里的过期不应该把 weibo.com 的有效值一起滤掉。
-                        if (!isWeiboSessionCookie(uri, cookie)) return@forEach
-                        if (cookie.hasExpired()) {
-                            removedNames += cookie.name
-                        } else {
-                            removedNames -= cookie.name
-                        }
-                    }
-            }
-        }
-    }
-
-    private fun isWeiboSessionCookie(uri: URI, cookie: HttpCookie): Boolean {
-        val explicitDomain = cookie.domain?.trim()?.removePrefix(".")?.lowercase()?.takeIf(String::isNotBlank)
-        if (explicitDomain != null) {
-            // 带 Domain 属性的是跨子域共享的 cookie（如 `.weibo.com`），删除确实会影响 weibo.com 会话。
-            return explicitDomain == WEIBO_BASE_DOMAIN || explicitDomain.endsWith(".$WEIBO_BASE_DOMAIN")
-        }
-        // 无 Domain 属性的是 host-only cookie，只作用于当前主机；
-        // passport / qr 主机上的同名删除不应该波及 weibo.com 的配置兜底值。
-        val host = uri.host?.trim()?.lowercase()?.takeIf(String::isNotBlank) ?: return false
-        return host == WEIBO_BASE_DOMAIN
-    }
-
-    private companion object {
-        private const val SET_COOKIE_HEADER: String = "Set-Cookie"
-        private const val SET_COOKIE2_HEADER: String = "Set-Cookie2"
-        private const val WEIBO_BASE_DOMAIN: String = "weibo.com"
-    }
-}
-
 internal class WeiboClient(
     private val config: WeiboPublisherConfig,
     private val httpClient: HttpClient = defaultHttpClient(),
+    private val cookieJar: WeiboCookieJar = WeiboCookieJar(config.cookie),
+    private val textTransport: (suspend (HttpRequest) -> HttpResponse<String>)? = null,
+    private val sessionTimeoutMillis: Long = 60_000,
 ) {
     private var cachedLoginAccount: PublisherLoginAccount? = null
-    private val videoDownloader = WeiboVideoDownloader(httpClient, DESKTOP_USER_AGENT)
+    private val videoDownloader by lazy {
+        WeiboVideoDownloader(defaultHttpClient(HttpClient.Redirect.NORMAL), DESKTOP_USER_AGENT)
+    }
 
-    suspend fun checkLoginState(): PublisherLoginResult {
-        val hasCookie = currentCookieHeader().isNotBlank()
+    suspend fun checkLoginState(expectedUserId: String? = null): PublisherLoginResult {
+        val hasCookie = !cookieJar.isEmpty()
         if (!hasCookie) {
             return PublisherLoginResult(
                 status = PublisherLoginStatus.FAILED,
@@ -157,17 +80,25 @@ internal class WeiboClient(
         }
 
         // 显式检查必须重新访问首页，不能使用关注流构造时缓存的账号信息。
-        val account = fetchCurrentAccount(forceRefresh = true)
+        val cookieCandidate = cookieJar.candidate()
+        val candidate = WeiboClient(config.copy(cookie = ""), httpClient, cookieCandidate.jar, textTransport)
+        val account = candidate.fetchHomeAccount()
         if (account == null) {
             return PublisherLoginResult(
                 status = PublisherLoginStatus.FAILED,
                 message = "微博登录状态不可用：PC 首页未包含当前账号信息",
             )
         }
+        if (expectedUserId != null && account.userId != expectedUserId) {
+            throw WeiboSessionException(WeiboSessionFailure.ACCOUNT_CHANGED)
+        }
+
+        if (!cookieJar.commit(cookieCandidate)) throw WeiboSessionException(WeiboSessionFailure.TRANSIENT)
+        cachedLoginAccount = account
 
         return PublisherLoginResult(
             status = PublisherLoginStatus.SUCCESS,
-            message = "微博登录状态可用",
+            message = if (cookieJar.canRefresh()) "微博登录状态可用" else "微博登录状态可用；缺少长期续期凭据，过期后需要重新登录",
             account = account,
         )
     }
@@ -233,7 +164,7 @@ internal class WeiboClient(
                     else -> {
                         return PublisherLoginResult(
                             status = PublisherLoginStatus.FAILED,
-                            message = poll.message.ifBlank { "微博二维码登录失败：code=${poll.code}" },
+                            message = "微博二维码登录失败：code=${poll.code}",
                         )
                     }
                 }
@@ -244,81 +175,47 @@ internal class WeiboClient(
         } catch (error: Throwable) {
             PublisherLoginResult(
                 status = PublisherLoginStatus.FAILED,
-                message = error.message ?: "微博二维码登录失败",
+                message = if (error is WeiboSessionException) error.failure.description else "微博二维码登录暂时失败，请重试",
             )
         }
     }
 
-    suspend fun refreshLoginSession(): PublisherLoginResult {
-        if (!hasCookie("SRF")) {
-            return PublisherLoginResult(
-                status = PublisherLoginStatus.FAILED,
-                message = "微博会话恢复缺少 SRF Cookie",
-            )
-        }
+    fun canRefreshSession(): Boolean = cookieJar.canRefresh()
+
+    suspend fun refreshLoginSession(expectedUserId: String? = null): PublisherLoginResult {
+        if (!canRefreshSession()) throw WeiboSessionException(WeiboSessionFailure.MISSING_CREDENTIAL)
+        val cookieCandidate = cookieJar.candidate()
+        val candidate = WeiboClient(config.copy(cookie = ""), httpClient, cookieCandidate.jar, textTransport, sessionTimeoutMillis)
         return try {
-            val token = requestSsoRestoreToken()
-                ?: return PublisherLoginResult(PublisherLoginStatus.FAILED, "微博会话恢复未获取到 SSO 令牌")
-            val metaResponse = sendTextRequest(
-                uri = buildExternalUri(
-                    SSO_LOGIN_URI,
-                    listOf(
-                        "entry" to "sso",
-                        "returntype" to "META",
-                        "gateway" to "1",
-                        "alt" to token.alt,
-                        "savestate" to token.saveState.toString(),
-                    ),
-                ),
-                referer = WEIBO_HOME,
-                accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                xRequestedWith = false,
-            )
-            if (metaResponse.statusCode() !in 200..299) {
-                return PublisherLoginResult(
-                    status = PublisherLoginStatus.FAILED,
-                    message = "微博会话恢复 SSO 跳转失败：status=${metaResponse.statusCode()}",
-                )
+            withTimeout(sessionTimeoutMillis) {
+                val response = candidate.sendLoginChain(buildExternalUri(SSO_LOGIN_URI, listOf(
+                    "url" to "$WEIBO_HOME/", "gateway" to "1", "service" to "miniblog",
+                    "entry" to "miniblog", "useticket" to "1", "returntype" to "META",
+                    "_rand" to System.currentTimeMillis().toString(),
+                )), requireFreshSession = true)
+                val account = response.takeIf { it.uri().host == "weibo.com" && it.uri().path in setOf("", "/") }
+                    ?.let { candidate.parseHomeAccountResponse(it.body()) } ?: candidate.fetchHomeAccount()
+                    ?: throw WeiboSessionException(WeiboSessionFailure.LOGIN_REQUIRED)
+                if (expectedUserId != null && account.userId != expectedUserId) {
+                    throw WeiboSessionException(WeiboSessionFailure.ACCOUNT_CHANGED)
+                }
+                if (!cookieJar.commit(cookieCandidate, renewed = true)) throw WeiboSessionException(WeiboSessionFailure.TRANSIENT)
+                cachedLoginAccount = account
+                PublisherLoginResult(PublisherLoginStatus.SUCCESS, "微博会话续期成功", account)
             }
-            val crossDomainUri = parseSsoMetaRedirect(metaResponse.body())
-                ?.let { value -> runCatching { URI.create(value) }.getOrNull() }
-                ?.takeIf { it.host == LOGIN_SINA_HOST }
-                ?: return PublisherLoginResult(PublisherLoginStatus.FAILED, "微博会话恢复未返回跨域跳转地址")
-            val crossResponse = sendJsonpRequest(
-                uri = buildExternalUri(
-                    crossDomainUri.toString(),
-                    listOf(
-                        "action" to "login",
-                        "entry" to "sso",
-                        "r" to WEIBO_HOME,
-                        "callback" to loginCallback(),
-                    ),
-                ),
-                operation = "恢复微博跨域会话",
-            )
-            val cross = parseSsoResponse(crossResponse)
-                ?: return PublisherLoginResult(PublisherLoginStatus.FAILED, "微博会话恢复跨域响应无效")
-            val urls = cross.array("arrURL").toUrlList()
-            if (urls.isEmpty()) {
-                return PublisherLoginResult(PublisherLoginStatus.FAILED, "微博会话恢复未返回 SSO 登录地址")
-            }
-            completeSsoLogin(urls)
-        } catch (error: CancellationException) {
-            throw error
-        } catch (error: Throwable) {
-            PublisherLoginResult(
-                status = PublisherLoginStatus.FAILED,
-                message = error.message ?: "微博会话恢复失败",
-            )
+        } catch (error: TimeoutCancellationException) {
+            throw WeiboSessionException(WeiboSessionFailure.TRANSIENT)
         }
     }
 
     internal fun exportCookieHeader(): String {
-        // 回存配置时以微博主域为准，优先导出 weibo.com 上的会话值（同名跨域 cookie 不会丢，只是不优先）。
-        return currentCookieHeader(URI.create(WEIBO_HOME).host)
+        return cookieJar.headerFor(URI.create("$WEIBO_HOME/"))
     }
 
+    internal fun exportCookiesJson(): String = cookieJar.exportJson()
+
     suspend fun fetchHomeAccount(): PublisherLoginAccount? {
+        requireConfiguredSession()
         val response = sendTextRequest(
             uri = URI.create(WEIBO_HOME),
             referer = WEIBO_HOME,
@@ -327,14 +224,19 @@ internal class WeiboClient(
             desktopDocument = true,
         )
         if (response.statusCode() !in 200..299) {
+            if (response.statusCode() in 300..399) return null
+            if (response.statusCode() in setOf(401, 403)) return null
             throw WeiboApiException("微博首页请求失败：status=${response.statusCode()}")
         }
-        return parseHomeAccountResponse(response.body())
+        parseHomeAccountResponse(response.body())?.let { return it }
+        if (response.body().isLoginChallenge()) throw WeiboSessionException(WeiboSessionFailure.CHALLENGE)
+        return null
     }
 
     internal fun parseHomeAccountResponse(html: String): PublisherLoginAccount? {
         val root = extractJsConfigObject(html) ?: return null
-        return root.obj("user")?.toPublisherSnapshot()?.toLoginAccount()
+        return root.obj("user")?.toPublisherSnapshot()?.takeIf { it.userId.all(Char::isDigit) && it.userId != "0" }
+            ?.toLoginAccount()
     }
 
     suspend fun fetchPublisherInfo(userId: String): WeiboPublisherSnapshot? {
@@ -775,11 +677,75 @@ internal class WeiboClient(
     }
 
     internal fun parseSsoMetaRedirect(html: String): String? {
-        val match = SSO_META_REDIRECT_PATTERN.find(html) ?: return null
-        return match.groupValues[2]
-            .replace("&amp;", "&")
-            .takeIf { it.startsWith("https://") || it.startsWith("http://") }
+        SSO_META_REDIRECT_PATTERN.find(html)?.let { return it.groupValues[2].replace("&amp;", "&") }
+        val tag = Regex("""<meta\b[^>]*http-equiv\s*=\s*['"]?refresh[^>]*>""", RegexOption.IGNORE_CASE).find(html)?.value
+            ?: return null
+        return Regex("""url\s*=\s*(?:&\#39;|['"])?([^'"<>]+)""", RegexOption.IGNORE_CASE)
+            .find(tag)?.groupValues?.get(1)?.trim()?.removeSuffix("&#39;")?.replace("&amp;", "&")
     }
+
+    private suspend fun sendLoginChain(initial: URI, requireFreshSession: Boolean = false): HttpResponse<String> {
+        var uri = initial
+        val visited = mutableSetOf<String>()
+        var issuedWebSession = false
+        repeat(11) { hop ->
+            if (hop == 10 || !visited.add(uri.toString())) throw WeiboSessionException(WeiboSessionFailure.PROTOCOL)
+            validateLoginUri(uri)
+            val response = sendTextRequest(uri, WEIBO_HOME, LOGIN_DOCUMENT_ACCEPT, false, true)
+            if (uri.host == PASSPORT_HOST && uri.path == "/sso/crossdomain") {
+                issuedWebSession = issuedWebSession || response.headers().allValues("Set-Cookie").any { raw ->
+                    runCatching { HttpCookie.parse(raw) }.getOrDefault(emptyList()).any { cookie ->
+                        cookie.name == "SUB" && cookie.domain?.removePrefix(".") == "weibo.com" &&
+                            cookie.value.isNotBlank() && !cookie.hasExpired()
+                    }
+                }
+            }
+            if (response.statusCode() == 429 || response.statusCode() >= 500) {
+                throw WeiboSessionException(WeiboSessionFailure.TRANSIENT)
+            }
+            val body = response.body()
+            if (body.isLoginChallenge() && parseHomeAccountResponse(body) == null) {
+                throw WeiboSessionException(WeiboSessionFailure.CHALLENGE)
+            }
+            val target = if (response.statusCode() in setOf(301, 302, 303, 307, 308)) {
+                response.headers().firstValue("Location").orElse(null)
+                    ?: throw WeiboSessionException(WeiboSessionFailure.PROTOCOL)
+            } else parseSsoMetaRedirect(body)
+            if (target != null) {
+                uri = runCatching { uri.resolve(target) }.getOrElse { throw WeiboSessionException(WeiboSessionFailure.PROTOCOL) }
+            } else {
+                if (body.contains("retcode=6102") || response.statusCode() in setOf(401, 403)) {
+                    throw WeiboSessionException(WeiboSessionFailure.LOGIN_REQUIRED)
+                }
+                if (response.statusCode() !in 200..299) throw WeiboSessionException(WeiboSessionFailure.PROTOCOL)
+                if (requireFreshSession && !issuedWebSession) throw WeiboSessionException(WeiboSessionFailure.LOGIN_REQUIRED)
+                return response
+            }
+        }
+        throw WeiboSessionException(WeiboSessionFailure.PROTOCOL)
+    }
+
+    private fun validateLoginUri(uri: URI) {
+        if (uri.scheme != "https" || uri.userInfo != null || uri.port !in setOf(-1, 443)) {
+            throw WeiboSessionException(WeiboSessionFailure.PROTOCOL)
+        }
+        if (uri.rawQuery?.contains("retcode=6102") == true || uri.path in setOf("/login.php", "/sso/signin")) {
+            if (uri.host != LOGIN_SINA_HOST || uri.path != "/sso/login.php") {
+                throw WeiboSessionException(WeiboSessionFailure.LOGIN_REQUIRED)
+            }
+        }
+        val allowed = when (uri.host) {
+            "weibo.com", "www.weibo.com" -> uri.path in setOf("", "/", "/newlogin")
+            LOGIN_SINA_HOST -> uri.path in setOf("/sso/login.php", "/sso/v2/crossdomain")
+            PASSPORT_HOST -> uri.path in setOf("/sso/crossdomain", "/sso/v2/login", "/sso/v2/pmproxy")
+            "passport.weibo.cn" -> uri.path == "/sso/crossdomain"
+            else -> false
+        }
+        if (!allowed) throw WeiboSessionException(WeiboSessionFailure.PROTOCOL)
+    }
+
+    private fun String.isLoginChallenge(): Boolean = contains("wbBotDetector") || contains("alc-auto-login") ||
+        contains("captcha", true) || contains("验证码")
 
     private suspend fun requestQrLoginPage() {
         val uri = URI.create(PASSPORT_QR_SIGN_IN_URI)
@@ -858,7 +824,7 @@ internal class WeiboClient(
         }
     }
 
-    private suspend fun completeQrLogin(poll: WeiboQrLoginPollSnapshot): PublisherLoginResult {
+    internal suspend fun completeQrLogin(poll: WeiboQrLoginPollSnapshot): PublisherLoginResult {
         val loginUri = poll.loginUrl?.let(::parseQrLoginUri)
         if (loginUri == null) {
             return PublisherLoginResult(
@@ -866,86 +832,22 @@ internal class WeiboClient(
                 message = "微博二维码确认响应未提供登录地址",
             )
         }
-        val response = sendTextRequest(
-            uri = loginUri,
-            referer = PASSPORT_QR_SIGN_IN_URI,
-            accept = LOGIN_DOCUMENT_ACCEPT,
-            xRequestedWith = false,
-            desktopDocument = true,
-        )
-        if (response.statusCode() !in 200..299) {
-            return PublisherLoginResult(
-                status = PublisherLoginStatus.FAILED,
-                message = "微博二维码会话登录失败：status=${response.statusCode()}",
-            )
+        return try {
+            withTimeout(sessionTimeoutMillis) {
+                val response = sendLoginChain(loginUri)
+                val account = response.takeIf { it.uri().host == "weibo.com" && it.uri().path in setOf("", "/") }
+                    ?.let { parseHomeAccountResponse(it.body()) } ?: fetchHomeAccount()
+                    ?: throw WeiboSessionException(WeiboSessionFailure.LOGIN_REQUIRED)
+                cachedLoginAccount = account
+                PublisherLoginResult(
+                    PublisherLoginStatus.SUCCESS,
+                    if (canRefreshSession()) "微博二维码登录成功" else "微博二维码登录成功；缺少长期续期凭据，过期后需要重新登录",
+                    account,
+                )
+            }
+        } catch (error: TimeoutCancellationException) {
+            throw WeiboSessionException(WeiboSessionFailure.TRANSIENT)
         }
-        cachedLoginAccount = null
-        return checkLoginState()
-    }
-
-    private suspend fun requestSsoRestoreToken(): WeiboSsoToken? {
-        val response = sendJsonpRequest(
-            uri = buildExternalUri(
-                PASSPORT_VISITOR_URI,
-                listOf(
-                    "a" to "restore",
-                    "cb" to "restore_back",
-                    "from" to "weibo",
-                    "_rand" to System.currentTimeMillis().toString(),
-                ),
-            ),
-            operation = "获取微博会话恢复令牌",
-        )
-        val root = parseSsoResponse(response) ?: return null
-        if (root.long("retcode") != QR_LOGIN_SUCCESS_CODE) return null
-        val data = root.obj("data") ?: return null
-        val alt = data.string("alt") ?: return null
-        return WeiboSsoToken(
-            alt = alt,
-            saveState = data.long("savestate")?.toInt() ?: DEFAULT_SSO_SAVE_STATE,
-        )
-    }
-
-    private suspend fun completeSsoLogin(crossDomainUrls: List<String>): PublisherLoginResult {
-        val ssoLoginUrl = crossDomainUrls
-            .firstOrNull { url -> runCatching { URI.create(url) }.getOrNull()?.host == PASSPORT_HOST }
-            ?: return PublisherLoginResult(PublisherLoginStatus.FAILED, "微博 SSO 会话缺少登录地址")
-        val ssoResponse = sendTextRequest(
-            uri = buildExternalUri(
-                ssoLoginUrl,
-                listOf(
-                    "action" to "login",
-                    "callback" to loginCallback(),
-                ),
-            ),
-            referer = WEIBO_HOME,
-            accept = LOGIN_ACCEPT,
-            xRequestedWith = false,
-        )
-        if (ssoResponse.statusCode() !in 200..299) {
-            return PublisherLoginResult(
-                status = PublisherLoginStatus.FAILED,
-                message = "微博二维码 SSO 登录失败：status=${ssoResponse.statusCode()}",
-            )
-        }
-        cachedLoginAccount = null
-        return checkLoginState()
-    }
-
-    private suspend fun sendJsonpRequest(
-        uri: URI,
-        operation: String,
-    ): String {
-        val response = sendTextRequest(
-            uri = uri,
-            referer = WEIBO_HOME,
-            accept = LOGIN_ACCEPT,
-            xRequestedWith = false,
-        )
-        if (response.statusCode() !in 200..299) {
-            throw WeiboApiException("${operation}失败：status=${response.statusCode()}")
-        }
-        return response.body()
     }
 
     private suspend fun sendQrLoginRequest(
@@ -969,7 +871,9 @@ internal class WeiboClient(
         parameters: List<Pair<String, String>>,
         referer: String,
     ): JsonElement {
+        requireConfiguredSession()
         val uri = buildUri(path, parameters)
+        val requestCookies = cookieJar.requestCookies(uri)
         val request = HttpRequest.newBuilder(uri)
             .timeout(Duration.ofSeconds(15))
             .header("Accept", "application/json, text/plain, */*")
@@ -978,7 +882,7 @@ internal class WeiboClient(
             .header("Referer", referer)
             .header("X-Requested-With", "XMLHttpRequest")
             .apply {
-                currentCookieHeader(uri.host).takeIf(String::isNotBlank)?.let { cookie ->
+                requestCookies.header.takeIf(String::isNotBlank)?.let { cookie ->
                     header("Cookie", cookie)
                     cookie.xsrfToken()?.let { token ->
                         header("X-XSRF-TOKEN", token)
@@ -991,9 +895,8 @@ internal class WeiboClient(
             .GET()
             .build()
 
-        val response = withContext(Dispatchers.IO) {
-            httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
-        }
+        val response = executeText(request, requestCookies.generation)
+        rejectLoginRedirect(response)
         return parseHttpJsonResponse(
             statusCode = response.statusCode(),
             path = path,
@@ -1008,6 +911,7 @@ internal class WeiboClient(
         xRequestedWith: Boolean = true,
         desktopDocument: Boolean = false,
     ): HttpResponse<String> {
+        val requestCookies = cookieJar.requestCookies(uri)
         val request = HttpRequest.newBuilder(uri)
             .timeout(Duration.ofSeconds(15))
             .header("Accept", accept)
@@ -1029,7 +933,7 @@ internal class WeiboClient(
                     header("Sec-Fetch-Site", "same-origin")
                     header("Sec-Fetch-User", "?1")
                 }
-                currentCookieHeader(uri.host).takeIf(String::isNotBlank)?.let { cookie ->
+                requestCookies.header.takeIf(String::isNotBlank)?.let { cookie ->
                     header("Cookie", cookie)
                     cookie.xsrfToken()?.let { header("X-XSRF-TOKEN", it) }
                 }
@@ -1037,9 +941,15 @@ internal class WeiboClient(
             .GET()
             .build()
 
-        return withContext(Dispatchers.IO) {
+        return executeText(request, requestCookies.generation)
+    }
+
+    private suspend fun executeText(request: HttpRequest, cookieGeneration: Long): HttpResponse<String> {
+        val response = textTransport?.invoke(request) ?: runInterruptible(Dispatchers.IO) {
             httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
         }
+        cookieJar.putIfCurrent(request.uri(), response.headers().map(), cookieGeneration)
+        return response
     }
 
     private suspend fun sendImageRequest(uri: URI): HttpResponse<InputStream> {
@@ -1062,10 +972,12 @@ internal class WeiboClient(
         parameters: List<Pair<String, String>>,
         referer: String,
     ): JsonElement {
+        requireConfiguredSession()
         val body = parameters.joinToString("&") { (name, value) ->
             "${name.urlEncode()}=${value.urlEncode()}"
         }
         val uri = URI.create("$WEIBO_HOME$path")
+        val requestCookies = cookieJar.requestCookies(uri)
         val request = HttpRequest.newBuilder(uri)
             .timeout(Duration.ofSeconds(15))
             .header("Accept", "application/json, text/plain, */*")
@@ -1075,7 +987,7 @@ internal class WeiboClient(
             .header("Referer", referer)
             .header("X-Requested-With", "XMLHttpRequest")
             .apply {
-                currentCookieHeader(uri.host).takeIf(String::isNotBlank)?.let { cookie ->
+                requestCookies.header.takeIf(String::isNotBlank)?.let { cookie ->
                     header("Cookie", cookie)
                     cookie.xsrfToken()?.let { header("X-XSRF-TOKEN", it) }
                 }
@@ -1083,9 +995,8 @@ internal class WeiboClient(
             .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
             .build()
 
-        val response = withContext(Dispatchers.IO) {
-            httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
-        }
+        val response = executeText(request, requestCookies.generation)
+        rejectLoginRedirect(response)
         return parseHttpJsonResponse(
             statusCode = response.statusCode(),
             path = path,
@@ -1098,6 +1009,9 @@ internal class WeiboClient(
         path: String,
         body: String,
     ): JsonElement {
+        if (statusCode == 429 || statusCode >= 500) {
+            throw WeiboApiException("微博接口暂时不可用：status=$statusCode，path=$path")
+        }
         val root = runCatching { WEIBO_JSON.parseToJsonElement(body) }
             .getOrElse { error ->
                 val message = "微博接口响应不是合法 JSON：status=$statusCode，path=$path"
@@ -1115,6 +1029,16 @@ internal class WeiboClient(
             throwRequestFailure(statusCode, path, jsonObject)
         }
         return root
+    }
+
+    private fun rejectLoginRedirect(response: HttpResponse<String>) {
+        if (response.statusCode() !in 300..399) return
+        val location = response.headers().firstValue("Location").orElse("")
+        val target = runCatching { response.uri().resolve(location) }.getOrNull() ?: return
+        if (target.host in setOf(LOGIN_SINA_HOST, PASSPORT_HOST) ||
+            (target.host in setOf("weibo.com", "www.weibo.com") && target.path in setOf("/login.php", "/newlogin"))) {
+            throw WeiboLoginException("微博接口要求重新登录")
+        }
     }
 
     private fun throwRequestFailure(
@@ -1137,6 +1061,10 @@ internal class WeiboClient(
         return URI.create("$WEIBO_HOME$path?$query")
     }
 
+    private fun requireConfiguredSession() {
+        if (cookieJar.isEmpty()) throw WeiboLoginException("微博 Cookie 未配置")
+    }
+
     private fun buildExternalUri(base: String, parameters: List<Pair<String, String>>): URI {
         val query = parameters.joinToString("&") { (name, value) ->
             "${name.urlEncode()}=${value.urlEncode()}"
@@ -1144,8 +1072,6 @@ internal class WeiboClient(
         val separator = if ('?' in base) '&' else '?'
         return URI.create("$base$separator$query")
     }
-
-    private fun loginCallback(): String = "STK_${System.currentTimeMillis()}"
 
     private fun JsonObject.toPublisherSnapshot(): WeiboPublisherSnapshot? {
         val userId = string("idstr") ?: long("id")?.toString() ?: return null
@@ -1507,14 +1433,6 @@ internal class WeiboClient(
 
     private fun JsonElement.asPrimitive(): JsonPrimitive? = this as? JsonPrimitive
 
-    private fun JsonArray.toUrlList(): List<String> {
-        return mapNotNull { item ->
-            item.asPrimitive()?.contentOrNull ?: item.asObject()?.string("url")
-        }.filter { url ->
-            url.startsWith("https://") || url.startsWith("http://")
-        }
-    }
-
     private fun String.urlEncode(): String {
         return URLEncoder.encode(this, StandardCharsets.UTF_8)
     }
@@ -1551,12 +1469,6 @@ internal class WeiboClient(
             output.write(buffer, 0, count)
         }
         return output.toByteArray()
-    }
-
-    private fun hasCookie(name: String): Boolean {
-        return currentCookieHeader()
-            .split(';')
-            .any { item -> item.substringBefore('=').trim() == name }
     }
 
     private fun String.toPlainWeiboText(): String {
@@ -1626,7 +1538,7 @@ internal class WeiboClient(
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
-            logger.debug(error) { "微博当前账号 PC 首页解析异常" }
+            logger.debug { "微博当前账号 PC 首页解析异常：type=${error::class.simpleName}" }
             null
         }
         if (account == null) {
@@ -1639,87 +1551,6 @@ internal class WeiboClient(
             "微博当前账号识别成功：source=pc_home，uid=${account.userId ?: "未知"}，name=${account.name ?: "未知"}"
         }
         return account
-    }
-
-    private fun currentCookieHeader(host: String? = null): String {
-        val removedNames = removedCookieNames()
-        val fallback = if (removedNames.isEmpty()) {
-            config.cookie
-        } else {
-            config.cookie.withoutCookies(removedNames)
-        }
-        return mergeCookieHeaders(fallback, cookieStoreHeader(host))
-    }
-
-    private fun cookieStoreHeader(host: String?): String {
-        val cookieManager = activeCookieManager() ?: return ""
-        val removedNames = removedCookieNames()
-        val candidates = cookieManager.cookieStore.cookies
-            .asSequence()
-            .filterNot { it.hasExpired() }
-            .filter { it.name.isNotBlank() && it.name !in removedNames }
-            // 同名 cookie 可能同时来自 `.weibo.com` 与 `.sina.com.cn`（SUB/SUBP 等）。
-            // 排序后再去重，让“取哪一条”由域名匹配度决定，而不是 CookieStore 的迭代顺序。
-            .sortedWith(
-                compareBy<HttpCookie> { it.name }
-                    .thenByDescending { domainAffinity(it, host) }
-                    .thenBy { it.domain.orEmpty() },
-            )
-            .toList()
-        val selected = LinkedHashMap<String, HttpCookie>()
-        candidates.forEach { cookie -> selected.putIfAbsent(cookie.name, cookie) }
-        return selected.entries.joinToString("; ") { (name, cookie) -> "$name=${cookie.value}" }
-    }
-
-    private fun domainAffinity(cookie: HttpCookie, host: String?): Int {
-        val domain = cookie.domain?.trim()?.removePrefix(".")?.lowercase()?.takeIf(String::isNotBlank) ?: return 0
-        val normalizedHost = host?.trim()?.removePrefix(".")?.lowercase()?.takeIf(String::isNotBlank) ?: return 0
-        return when {
-            normalizedHost == domain -> 3
-            normalizedHost.endsWith(".$domain") -> 2
-            else -> 1
-        }
-    }
-
-    private fun activeCookieManager(): CookieManager? {
-        return when (val handler = httpClient.cookieHandler().orElse(null)) {
-            is WeiboCookieJar -> handler.cookieManager
-            is CookieManager -> handler
-            else -> null
-        }
-    }
-
-    private fun removedCookieNames(): Set<String> {
-        return (httpClient.cookieHandler().orElse(null) as? WeiboCookieJar)?.removedCookieNames.orEmpty()
-    }
-
-    private fun String.withoutCookies(names: Set<String>): String {
-        return split(';')
-            .mapNotNull { raw ->
-                val index = raw.indexOf('=')
-                if (index <= 0) return@mapNotNull null
-                val name = raw.substring(0, index).trim()
-                if (name.isBlank() || name in names) return@mapNotNull null
-                "$name=${raw.substring(index + 1).trim()}"
-            }
-            .joinToString("; ")
-    }
-
-    private fun mergeCookieHeaders(vararg headers: String?): String {
-        val values = LinkedHashMap<String, String>()
-        headers.forEach { header ->
-            header?.split(';')
-                ?.mapNotNull { raw ->
-                    val index = raw.indexOf('=')
-                    if (index <= 0) return@mapNotNull null
-                    val name = raw.substring(0, index).trim()
-                    val value = raw.substring(index + 1).trim()
-                    if (name.isBlank()) return@mapNotNull null
-                    name to value
-                }
-                ?.forEach { (name, value) -> values[name] = value }
-        }
-        return values.entries.joinToString("; ") { (name, value) -> "$name=$value" }
     }
 
     private fun extractJsConfigObject(html: String): JsonObject? {
@@ -1776,15 +1607,12 @@ internal class WeiboClient(
         private const val PASSPORT_HOST: String = "passport.weibo.com"
         private const val LOGIN_SINA_HOST: String = "login.sina.com.cn"
         private const val QR_IMAGE_HOST: String = "v2.qr.weibo.cn"
-        private const val PASSPORT_VISITOR_URI: String = "https://passport.weibo.com/visitor/visitor"
         private const val PASSPORT_QR_SIGN_IN_URI: String =
             "https://passport.weibo.com/sso/signin?entry=miniblog&source=miniblog&disp=popup&url=https%3A%2F%2Fweibo.com%2Fnewlogin%3Ftabtype%3Dweibo%26gid%3D102803%26openLoginLayer%3D0%26url%3Dhttps%3A%2F%2Fweibo.com%2F&from=weibopro"
         private const val SSO_QRCODE_IMAGE_URI: String = "https://passport.weibo.com/sso/v2/qrcode/image"
         private const val SSO_QRCODE_CHECK_URI: String = "https://passport.weibo.com/sso/v2/qrcode/check"
-        private const val SSO_QRCODE_LOGIN_URI: String = "https://passport.weibo.com/sso/v2/login"
         private const val SSO_QRCODE_LOGIN_PATH: String = "/sso/v2/login"
         private const val SSO_LOGIN_URI: String = "https://login.sina.com.cn/sso/login.php"
-        private const val LOGIN_ACCEPT: String = "text/javascript, application/javascript, */*; q=0.01"
         private const val LOGIN_DOCUMENT_ACCEPT: String =
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         private const val QR_LOGIN_ACCEPT: String = "application/json, text/plain, */*"
@@ -1798,7 +1626,6 @@ internal class WeiboClient(
         private const val QR_LOGIN_SIZE: Int = 180
         private const val QR_LOGIN_POLL_INTERVAL_MILLIS: Long = 3_000
         private const val QR_LOGIN_TIMEOUT_MILLIS: Long = 180_000
-        private const val DEFAULT_SSO_SAVE_STATE: Int = 30
         private const val MAX_QR_IMAGE_BYTES: Int = 1_024 * 1_024
         private const val QR_IMAGE_READ_BUFFER_SIZE: Int = 8 * 1_024
         private const val DESKTOP_USER_AGENT: String =
@@ -1827,10 +1654,9 @@ internal class WeiboClient(
         private val WEIBO_TIME_FORMATTER: DateTimeFormatter =
             DateTimeFormatter.ofPattern("EEE MMM dd HH:mm:ss Z yyyy", Locale.ENGLISH)
 
-        private fun defaultHttpClient(): HttpClient {
+        private fun defaultHttpClient(redirects: HttpClient.Redirect = HttpClient.Redirect.NEVER): HttpClient {
             return HttpClient.newBuilder()
-                .cookieHandler(WeiboCookieJar())
-                .followRedirects(HttpClient.Redirect.NORMAL)
+                .followRedirects(redirects)
                 .connectTimeout(Duration.ofSeconds(10))
                 .build()
         }
@@ -1846,12 +1672,14 @@ internal class WeiboHttpGateway(
     private var cachedFriendTimelineListId: String? = null
 
     override fun exportCookie(): String {
-        return client.exportCookieHeader()
+        return client.exportCookiesJson()
     }
 
-    override suspend fun checkLoginState(): PublisherLoginResult {
+    override fun canRefreshSession(): Boolean = client.canRefreshSession()
+
+    override suspend fun checkLoginState(expectedUserId: String?): PublisherLoginResult {
         return withRequestInterval {
-            client.checkLoginState()
+            client.checkLoginState(expectedUserId)
         }
     }
 
@@ -1862,8 +1690,8 @@ internal class WeiboHttpGateway(
         return client.loginByQrCode(onQrCode, onStatusChanged)
     }
 
-    override suspend fun refreshLoginSession(): PublisherLoginResult {
-        return client.refreshLoginSession()
+    override suspend fun refreshLoginSession(expectedUserId: String?): PublisherLoginResult {
+        return client.refreshLoginSession(expectedUserId)
     }
 
     override suspend fun fetchPublisherSnapshot(userId: String): WeiboPublisherSnapshot? {

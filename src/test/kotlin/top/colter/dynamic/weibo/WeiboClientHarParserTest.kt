@@ -5,11 +5,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import top.colter.dynamic.core.plugin.FollowActionStatus
-import java.net.CookieManager
-import java.net.CookiePolicy
-import java.net.HttpCookie
 import java.net.URI
-import java.net.http.HttpClient
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -411,27 +407,12 @@ class WeiboClientHarParserTest {
 
     @Test
     fun `export cookie should merge runtime cookies over configured cookie`() {
-        val cookieManager = CookieManager(null, CookiePolicy.ACCEPT_ALL)
-        cookieManager.cookieStore.add(
-            URI.create("https://weibo.com"),
-            HttpCookie("SUB", "new").apply {
-                domain = ".weibo.com"
-                path = "/"
-            },
-        )
-        cookieManager.cookieStore.add(
-            URI.create("https://weibo.com"),
-            HttpCookie("fresh", "1").apply {
-                domain = ".weibo.com"
-                path = "/"
-            },
-        )
-        val httpClient = HttpClient.newBuilder()
-            .cookieHandler(cookieManager)
-            .build()
+        val jar = WeiboCookieJar("SUB=old; XSRF-TOKEN=token")
+        jar.put(URI("https://weibo.com/"), mapOf("Set-Cookie" to listOf(
+            "SUB=new; Domain=.weibo.com; Path=/", "fresh=1; Domain=.weibo.com; Path=/",
+        )))
         val client = WeiboClient(
-            config = WeiboPublisherConfig(cookie = "SUB=old; XSRF-TOKEN=token"),
-            httpClient = httpClient,
+            config = WeiboPublisherConfig(), cookieJar = jar,
         )
 
         assertEquals("SUB=new; XSRF-TOKEN=token; fresh=1", client.exportCookieHeader())

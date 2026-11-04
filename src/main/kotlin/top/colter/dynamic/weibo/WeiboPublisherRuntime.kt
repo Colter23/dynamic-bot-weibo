@@ -105,13 +105,19 @@ internal class WeiboPublisherRuntime() :
     private lateinit var notificationPublisher: SystemNotificationPublisher
     private lateinit var subscriptionQueryService: SubscriptionQueryService
     private lateinit var config: WeiboPublisherConfig
-    private lateinit var gateway: WeiboGateway
+    private lateinit var initialGateway: WeiboGateway
+    private val gateway: WeiboGateway
+        get() = if (::sessions.isInitialized) sessions.gateway else initialGateway
     private lateinit var mapper: WeiboDynamicMapper
     private lateinit var linkResolver: WeiboLinkResolver
     private lateinit var requestFailureHandler: WeiboRequestFailureHandler
     private lateinit var cursorStore: WeiboCursorStore
     private lateinit var detectTask: TaskDefinition
     private lateinit var keepaliveTask: TaskDefinition
+    private lateinit var sessions: WeiboSessionCoordinator
+    private val configLock = Any()
+    private var persistedCookie: String = ""
+    @Volatile private var running = false
 
     private val detectMutex: Mutex = Mutex()
     private val loginMutex: Mutex = Mutex()
@@ -123,12 +129,6 @@ internal class WeiboPublisherRuntime() :
 
     @Volatile
     private var pendingDetection: Boolean = false
-
-    @Volatile
-    private var lastLoginValidationAtMillis: Long = 0L
-
-    @Volatile
-    private var lastPausedLoginRecoveryAtMillis: Long = 0L
 
     private var startupReplayPending: Boolean = false
     private var startupCursorWarmupPending: Boolean = false
@@ -173,12 +173,26 @@ internal class WeiboPublisherRuntime() :
         }
 
         config = loadConfig(pluginId)
+        persistedCookie = config.cookie
         WeiboPublisherConfigForm.validate(config)
-        gateway = gatewayFactory(config)
+        initialGateway = gatewayFactory(config)
         mapper = WeiboDynamicMapper()
         requestFailureHandler = WeiboRequestFailureHandler(
             configProvider = { config },
             notificationPublisher = notificationPublisher,
+        )
+        sessions = WeiboSessionCoordinator(
+            initialGateway = gateway,
+            parentScope = context.scope,
+            dataStore = context.dataStore,
+            persistCookies = ::saveRuntimeCookies,
+            notifications = notificationPublisher,
+            onHealthy = {
+                requestFailureHandler.recordSuccess("微博登录会话校验")
+                if (running && config.pollingEnabled && !taskScheduler.isRunning(detectTaskId)) {
+                    bootstrapLoggedInState(allowReplay = true)
+                }
+            },
         )
         linkResolver = WeiboLinkResolver(
             platformId = platformId,
@@ -186,7 +200,9 @@ internal class WeiboPublisherRuntime() :
             mapper = mapper,
             publisherInfoResolver = ::fetchPublisherInfo,
             requestFailureHandler = requestFailureHandler,
-            sessionRenewer = { checkLoginState() },
+            sessionRenewer = { knownExpired -> sessions.check(waitMillis = null, minimumIntervalMillis = 5 * 60_000, knownExpired = knownExpired) },
+            isLoginExpired = { sessions.isConfirmedExpired() },
+            sessionRevision = { sessions.revision() },
         )
         cursorStore = cursorStoreFactory()
         detectTask = TaskDefinition(
@@ -199,7 +215,7 @@ internal class WeiboPublisherRuntime() :
         keepaliveTask = TaskDefinition(
             id = keepaliveTaskId,
             name = "微博会话保活",
-            description = "定期访问微博首页续期登录会话，避免链接解析在会话过期后失效。",
+            description = "检查微博会话，每天通过 SSO 续期，失效时尝试恢复。",
             schedule = TaskSchedule.FixedDelay(
                 SESSION_KEEPALIVE_INTERVAL_MILLIS.milliseconds,
                 runImmediately = true,
@@ -211,18 +227,15 @@ internal class WeiboPublisherRuntime() :
     }
 
     override suspend fun onStart() {
+        sessions.start()
+        running = true
         // 会话保活与轮询无关：即使没有订阅、只用链接解析，也需要定期续期微博登录会话。
         startSessionKeepaliveTask()
         if (!config.pollingEnabled) {
             logger.info { "微博轮询未启用；链接解析依赖会话保活任务维持登录状态" }
             return
         }
-        val initialLoginResult = checkLoginState()
-        val loginResult = if (initialLoginResult.status == PublisherLoginStatus.SUCCESS) {
-            initialLoginResult
-        } else {
-            restoreLoginSession(initialLoginResult)
-        }
+        val loginResult = sessions.check(waitMillis = null, minimumIntervalMillis = LOGIN_VALIDATION_INTERVAL_MILLIS)
         if (loginResult.status != PublisherLoginStatus.SUCCESS) {
             logger.warn {
                 "微博轮询未启动：登录状态=${loginResult.status}，原因=${loginResult.message}"
@@ -237,21 +250,25 @@ internal class WeiboPublisherRuntime() :
     }
 
     override suspend fun onStop() {
+        running = false
         if (::taskScheduler.isInitialized) {
             taskScheduler.stop(detectTaskId)
             taskScheduler.stop(keepaliveTaskId)
         }
+        if (::sessions.isInitialized) sessions.stop()
         runCatching { persistRuntimeCookieIfChanged() }
             .onFailure {
-                logger.warn(it) { "停止微博轮询前回存 Cookie 失败" }
+                logger.warn { "停止微博轮询前回存 Cookie 失败" }
             }
         logger.info { "微博轮询已停止" }
     }
 
     override suspend fun onUnload() {
+        running = false
+        if (::sessions.isInitialized) sessions.stop()
         runCatching { persistRuntimeCookieIfChanged() }
             .onFailure {
-                logger.warn(it) { "卸载微博插件前回存 Cookie 失败" }
+                logger.warn { "卸载微博插件前回存 Cookie 失败" }
             }
     }
 
@@ -266,9 +283,21 @@ internal class WeiboPublisherRuntime() :
             return ConfigApplyResult(changed = false, message = "微博配置未变化")
         }
 
-        config = next
-        if (::gateway.isInitialized) {
-            gateway = gatewayFactory(next)
+        if (::initialGateway.isInitialized && (previous.cookie != next.cookie ||
+            previous.requestIntervalSeconds != next.requestIntervalSeconds || previous.followGroupName != next.followGroupName ||
+            previous.autoCreateFollowGroup != next.autoCreateFollowGroup)) {
+            if (::sessions.isInitialized) {
+                sessions.reconfigure(
+                    create = { active -> gatewayFactory(if (previous.cookie == next.cookie) next.copy(cookie = active.exportCookie()) else next) },
+                    updateConfig = { synchronized(configLock) { config = next; persistedCookie = "" } },
+                    credentialsChanged = previous.cookie != next.cookie,
+                )
+            } else {
+                initialGateway = gatewayFactory(next)
+                synchronized(configLock) { config = next; persistedCookie = next.cookie }
+            }
+        } else {
+            synchronized(configLock) { config = next; persistedCookie = next.cookie }
         }
 
         val restartRequired = previous.pollingEnabled != next.pollingEnabled ||
@@ -334,27 +363,7 @@ internal class WeiboPublisherRuntime() :
     }
 
     override suspend fun checkLoginState(): PublisherLoginResult {
-        val result = try {
-            // 会话保活任务、检测任务和后台刷新可能同时触发检查；用同一把登录锁避免并发访问首页与并发回存配置。
-            loginMutex.withLock { gateway.checkLoginState() }
-        } catch (error: CancellationException) {
-            throw error
-        } catch (error: Throwable) {
-            PublisherLoginResult(
-                status = PublisherLoginStatus.FAILED,
-                message = error.message ?: "微博登录状态检查失败",
-            )
-        }
-        if (result.status == PublisherLoginStatus.SUCCESS) {
-            lastLoginValidationAtMillis = System.currentTimeMillis()
-            // 手动刷新或连接解析触发的检查成功后，应同时解除“连续未登录暂停”，否则会出现
-            // 后台显示已登录、轮询却仍被暂停的情况。
-            if (::requestFailureHandler.isInitialized) {
-                requestFailureHandler.recordSuccess("微博登录状态检查")
-            }
-            persistRuntimeCookieIfChanged()
-        }
-        return result
+        return sessions.check()
     }
 
     override fun matchesLink(inputUrl: String): Boolean {
@@ -375,41 +384,49 @@ internal class WeiboPublisherRuntime() :
         }.getOrThrow()
     }
 
-    override suspend fun loginByCookie(cookie: String): PublisherLoginResult {
+    override suspend fun loginByCookie(cookie: String): PublisherLoginResult = loginMutex.withLock {
+        val generation = sessions.generation()
         val trimmed = cookie.trim()
         if (trimmed.isBlank()) {
-            return PublisherLoginResult(PublisherLoginStatus.FAILED, "微博 Cookie 不能为空")
+            return@withLock PublisherLoginResult(PublisherLoginStatus.FAILED, "微博 Cookie 不能为空")
         }
-        val previous = currentConfig()
-        val next = previous.copy(cookie = trimmed)
-        config = next
-        gateway = gatewayFactory(next)
-        val result = checkLoginState()
+        val candidate = try { gatewayFactory(currentConfig().copy(cookie = trimmed)) } catch (_: Throwable) {
+            return@withLock PublisherLoginResult(PublisherLoginStatus.FAILED, "微博 Cookie 格式无效，请检查字符串或完整 JSON")
+        }
+        var renewed = false
+        val result = try {
+            val initial = candidate.checkLoginState()
+            if (initial.status == PublisherLoginStatus.SUCCESS || !candidate.canRefreshSession()) initial
+            else candidate.refreshLoginSession().also { renewed = it.status == PublisherLoginStatus.SUCCESS }
+        } catch (error: CancellationException) { throw error } catch (error: WeiboSessionException) {
+            PublisherLoginResult(PublisherLoginStatus.FAILED, error.failure.description)
+        } catch (_: Throwable) {
+            PublisherLoginResult(PublisherLoginStatus.FAILED, WeiboSessionFailure.TRANSIENT.description)
+        }
         if (result.status == PublisherLoginStatus.SUCCESS) {
-            requestFailureHandler.recordSuccess("Cookie 登录")
-            if (!persistRuntimeCookieIfChanged()) {
-                saveConfig(pluginId, config)
+            if (!sessions.replace(candidate, result, generation, renewed = renewed)) {
+                return@withLock PublisherLoginResult(PublisherLoginStatus.CANCELED, "登录期间配置已更新，请重新操作")
             }
+            requestFailureHandler.recordSuccess("Cookie 登录")
             if (config.pollingEnabled && ::taskScheduler.isInitialized) {
                 bootstrapLoggedInState(allowReplay = !taskScheduler.isRunning(detectTaskId))
             }
-        } else {
-            config = previous
-            gateway = gatewayFactory(previous)
         }
-        return result
+        result
     }
 
     override suspend fun loginByQrCode(
         onQrCode: suspend (PublisherQrLoginChallenge) -> Unit,
         onStatusChanged: suspend (PublisherLoginResult) -> Unit,
     ): PublisherLoginResult = loginMutex.withLock {
-        val qrResult = gateway.loginByQrCode(onQrCode, onStatusChanged)
+        val generation = sessions.generation()
+        val candidate = gatewayFactory(config.copy(cookie = ""))
+        val qrResult = candidate.loginByQrCode(onQrCode, onStatusChanged)
         if (qrResult.status != PublisherLoginStatus.SUCCESS) {
             return@withLock qrResult
         }
 
-        val refreshedCookie = gateway.exportCookie().trim()
+        val refreshedCookie = candidate.exportCookie().trim()
         if (refreshedCookie.isBlank()) {
             return@withLock PublisherLoginResult(
                 status = PublisherLoginStatus.FAILED,
@@ -417,41 +434,21 @@ internal class WeiboPublisherRuntime() :
             )
         }
 
-        val nextConfig = config.copy(cookie = refreshedCookie)
-        val nextGateway = gatewayFactory(nextConfig)
-        val verified = try {
-            nextGateway.checkLoginState()
-        } catch (error: CancellationException) {
-            throw error
-        } catch (error: Throwable) {
-            PublisherLoginResult(
-                status = PublisherLoginStatus.FAILED,
-                message = error.message ?: "微博二维码登录后的会话校验失败",
-            )
+        if (!sessions.replace(candidate, qrResult, generation, renewed = true)) {
+            return@withLock PublisherLoginResult(PublisherLoginStatus.CANCELED, "登录期间配置已更新，请重新操作")
         }
-        if (verified.status != PublisherLoginStatus.SUCCESS) {
-            return@withLock PublisherLoginResult(
-                status = PublisherLoginStatus.FAILED,
-                message = "微博二维码登录后的会话校验失败：${verified.message}",
-            )
-        }
-
-        config = nextConfig
-        gateway = nextGateway
-        lastLoginValidationAtMillis = System.currentTimeMillis()
-        runCatching { saveConfig(pluginId, config) }
-            .onFailure { logger.warn(it) { "保存微博二维码登录 Cookie 失败" } }
         requestFailureHandler.recordSuccess("二维码登录")
         if (config.pollingEnabled && ::taskScheduler.isInitialized) {
             bootstrapLoggedInState(allowReplay = !taskScheduler.isRunning(detectTaskId))
         }
-        val result = verified.copy(message = "微博二维码登录成功")
+        val result = qrResult
         onStatusChanged(result)
         result
     }
 
     override suspend fun exportCookie(): String? {
-        return currentConfig().cookie.trim().takeIf { it.isNotBlank() }
+        sessions.persist()
+        return gateway.exportCookie().trim().takeIf { it.isNotBlank() && it != "[]" }
     }
 
     override suspend fun onSubscriptionChanged(event: SubscriptionChangedEvent) {
@@ -817,66 +814,34 @@ internal class WeiboPublisherRuntime() :
         operation: String,
         block: suspend () -> T,
     ): Result<T> {
-        return requestFailureHandler.run(operation, block)
+        return try {
+            val result = block()
+            requestFailureHandler.recordSuccess(operation)
+            Result.success(result)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            if (error is WeiboLoginException && sessions.check(waitMillis = null, knownExpired = true).status == PublisherLoginStatus.SUCCESS) {
+                requestFailureHandler.recordSuccess("$operation 会话恢复")
+            } else {
+                requestFailureHandler.recordFailure(operation, error)
+            }
+            Result.failure(error)
+        }
     }
 
     private suspend fun ensurePollingLoginState(forceRefresh: Boolean = false): Boolean {
-        val now = System.currentTimeMillis()
-        if (forceRefresh) {
-            if (now - lastPausedLoginRecoveryAtMillis < LOGIN_VALIDATION_INTERVAL_MILLIS) {
-                return false
-            }
-            lastPausedLoginRecoveryAtMillis = now
-        } else if (now - lastLoginValidationAtMillis < LOGIN_VALIDATION_INTERVAL_MILLIS) {
-            return true
-        }
-
-        val initialResult = checkLoginState()
-        val result = if (initialResult.status == PublisherLoginStatus.SUCCESS) {
-            initialResult
-        } else {
-            restoreLoginSession(initialResult)
-        }
+        val result = sessions.check(waitMillis = null, minimumIntervalMillis = if (forceRefresh) SESSION_KEEPALIVE_INTERVAL_MILLIS else LOGIN_VALIDATION_INTERVAL_MILLIS)
         if (result.status == PublisherLoginStatus.SUCCESS) {
-            lastPausedLoginRecoveryAtMillis = 0L
             requestFailureHandler.recordSuccess("微博定期登录状态检查")
             return true
         }
 
-        requestFailureHandler.recordFailure(
-            operation = "微博定期登录状态检查",
-            error = WeiboLoginException(result.message),
+        if (sessions.isConfirmedExpired()) requestFailureHandler.recordFailure(
+            operation = "微博定期登录状态检查", error = WeiboLoginException(result.message),
         )
         logger.warn { "微博定期登录状态检查失败：${result.message}" }
         return false
-    }
-
-    private suspend fun restoreLoginSession(failedResult: PublisherLoginResult): PublisherLoginResult {
-        val restoredResult = loginMutex.withLock {
-            try {
-                gateway.refreshLoginSession()
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Throwable) {
-                PublisherLoginResult(
-                    status = PublisherLoginStatus.FAILED,
-                    message = error.message ?: "微博会话恢复失败",
-                )
-            }
-        }
-        if (restoredResult.status == PublisherLoginStatus.SUCCESS) {
-            lastLoginValidationAtMillis = System.currentTimeMillis()
-            persistRuntimeCookieIfChanged()
-            logger.info {
-                "微博会话恢复成功：账号=${restoredResult.account?.name ?: restoredResult.account?.userId ?: "未知"}"
-            }
-            return restoredResult
-        }
-
-        logger.info { "微博会话恢复未成功：${restoredResult.message}" }
-        return failedResult.copy(
-            message = "${failedResult.message}；会话恢复失败：${restoredResult.message}",
-        )
     }
 
     private suspend fun publishSourceUpdate(update: SourceUpdate): Boolean {
@@ -934,26 +899,8 @@ internal class WeiboPublisherRuntime() :
         return started
     }
 
-    /**
-     * 定期访问微博首页续期登录会话。
-     *
-     * 微博的登录会话不会因为读取动态/资料接口而续期，只有访问 PC 首页才会下发新的 `Set-Cookie`。
-     * 过去这一步只在轮询里做，导致“没有订阅、只做链接解析”的部署永远不会续期，几天后解析全部失效，
-     * 必须到后台手动点一次刷新才能恢复。这里把它独立成任务，与轮询开关无关。
-     */
     private suspend fun ensureSessionAlive() {
-        val now = System.currentTimeMillis()
-        if (now - lastLoginValidationAtMillis < SESSION_KEEPALIVE_INTERVAL_MILLIS) {
-            logger.debug { "微博会话保活跳过：近期已完成登录状态校验" }
-            return
-        }
-
-        val initialResult = checkLoginState()
-        val result = if (initialResult.status == PublisherLoginStatus.SUCCESS) {
-            initialResult
-        } else {
-            restoreLoginSession(initialResult)
-        }
+        val result = sessions.check(waitMillis = null, minimumIntervalMillis = SESSION_KEEPALIVE_INTERVAL_MILLIS)
         if (result.status == PublisherLoginStatus.SUCCESS) {
             requestFailureHandler.recordSuccess("微博会话保活")
             logger.info {
@@ -966,7 +913,7 @@ internal class WeiboPublisherRuntime() :
             return
         }
         logger.warn { "微博会话保活失败：${result.message}" }
-        requestFailureHandler.recordFailure(
+        if (sessions.isConfirmedExpired()) requestFailureHandler.recordFailure(
             operation = "微博会话保活",
             error = WeiboLoginException(result.message),
         )
@@ -985,17 +932,21 @@ internal class WeiboPublisherRuntime() :
     }
 
     private fun persistRuntimeCookieIfChanged(): Boolean {
-        if (!::gateway.isInitialized) return false
-        val latest = gateway.exportCookie().trim().takeIf { it.isNotBlank() } ?: return false
-        if (latest == config.cookie.trim()) return false
+        return if (::sessions.isInitialized) sessions.persist() else false
+    }
+
+    private fun saveRuntimeCookies(latest: String): Boolean = synchronized(configLock) {
+        if (latest.isBlank()) return@synchronized true
         config = config.copy(cookie = latest)
-        runCatching {
+        if (latest == persistedCookie) return@synchronized true
+        try {
             saveConfig(pluginId, config)
-        }.onFailure {
-            logger.warn(it) { "回存微博运行期 Cookie 失败" }
+            persistedCookie = latest
+            true
+        } catch (_: Throwable) {
+            logger.warn { "回存微博 Cookie 失败，将在后续检查时重试" }
+            false
         }
-        logger.debug { "微博运行期 Cookie 已回存配置" }
-        return true
     }
 
     private fun replayWindowStart(now: Long): Long {

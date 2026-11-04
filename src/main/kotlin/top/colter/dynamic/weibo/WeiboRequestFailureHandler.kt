@@ -90,8 +90,6 @@ internal class WeiboRequestFailureHandler(
         when (error) {
             is WeiboLoginException -> recordLoginFailure(
                 operation = operation,
-                message = error.message ?: "微博登录状态不可用",
-                cause = error,
             )
             is WeiboApiException -> recordApiFailure(operation, error)
             else -> recordUnknownFailure(operation, error)
@@ -100,22 +98,14 @@ internal class WeiboRequestFailureHandler(
 
     private suspend fun recordLoginFailure(
         operation: String,
-        message: String,
-        cause: Throwable?,
     ) {
         consecutiveLoginFailures += 1
         val threshold = configProvider().maxConsecutiveLoginFailures
         if (threshold > 0 && consecutiveLoginFailures >= threshold) {
             if (!pollingPausedByLoginFailure) {
                 pollingPausedByLoginFailure = true
-                if (cause == null) {
-                    requestFailureLogger.error {
-                        "微博登录状态失效，已暂停轮询请求：operation=$operation，连续未登录失败=$consecutiveLoginFailures，阈值=$threshold。请重新登录或更新 Cookie。"
-                    }
-                } else {
-                    requestFailureLogger.error(cause) {
-                        "微博登录状态失效，已暂停轮询请求：operation=$operation，连续未登录失败=$consecutiveLoginFailures，阈值=$threshold。请重新登录或更新 Cookie。"
-                    }
+                requestFailureLogger.error {
+                    "微博登录状态失效，已暂停轮询请求：operation=$operation，连续未登录失败=$consecutiveLoginFailures，阈值=$threshold。请重新登录或更新 Cookie。"
                 }
                 publishNotification(
                     SystemNotificationPublishRequest(
@@ -128,56 +118,44 @@ internal class WeiboRequestFailureHandler(
                             "operation" to operation,
                             "consecutiveLoginFailures" to consecutiveLoginFailures.toString(),
                             "threshold" to threshold.toString(),
-                            "error" to message,
                         ),
                     ),
                 )
             } else {
-                if (cause == null) {
-                    requestFailureLogger.warn {
-                        "微博轮询仍处于未登录暂停状态：operation=$operation，连续未登录失败=$consecutiveLoginFailures，阈值=$threshold"
-                    }
-                } else {
-                    requestFailureLogger.warn(cause) {
-                        "微博轮询仍处于未登录暂停状态：operation=$operation，连续未登录失败=$consecutiveLoginFailures，阈值=$threshold"
-                    }
+                requestFailureLogger.warn {
+                    "微博轮询仍处于未登录暂停状态：operation=$operation，连续未登录失败=$consecutiveLoginFailures，阈值=$threshold"
                 }
             }
             return
         }
 
         val logMessage = if (threshold > 0) {
-            "微博请求未登录：operation=$operation，连续未登录失败=$consecutiveLoginFailures/$threshold，原因=$message"
+            "微博请求未登录：operation=$operation，连续未登录失败=$consecutiveLoginFailures/$threshold"
         } else {
-            "微博请求未登录：operation=$operation，自动暂停已关闭，原因=$message"
+            "微博请求未登录：operation=$operation，自动暂停已关闭"
         }
-        if (cause == null) {
-            requestFailureLogger.warn { logMessage }
-        } else {
-            requestFailureLogger.warn(cause) {
-                logMessage
-            }
-        }
+        requestFailureLogger.warn { logMessage }
     }
 
     private fun recordApiFailure(operation: String, error: WeiboApiException) {
         consecutiveLoginFailures = 0
-        requestFailureLogger.warn(error) {
-            "微博接口请求失败：operation=$operation，原因=${error.message ?: "未知"}"
+        requestFailureLogger.warn {
+            "微博接口请求失败：operation=$operation，type=${error::class.simpleName}"
         }
     }
 
     private fun recordUnknownFailure(operation: String, error: Throwable) {
         consecutiveLoginFailures = 0
-        requestFailureLogger.warn(error) {
-            "微博请求出现未知异常：operation=$operation，类型=${error::class.qualifiedName ?: error::class.simpleName ?: "未知"}，原因=${error.message ?: "未知"}"
+        requestFailureLogger.warn {
+            "微博请求出现未知异常：operation=$operation，类型=${error::class.simpleName ?: "未知"}"
         }
     }
 
     private suspend fun publishNotification(request: SystemNotificationPublishRequest) {
         runCatching { notificationPublisher.publish(request) }
             .onFailure {
-                requestFailureLogger.warn(it) { "微博系统通知发布失败：type=${request.type}" }
+                if (it is CancellationException) throw it
+                requestFailureLogger.warn { "微博系统通知发布失败：type=${request.type}" }
             }
     }
 }
