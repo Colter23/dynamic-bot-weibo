@@ -16,6 +16,11 @@ import top.colter.dynamic.core.plugin.PublisherLoginResult
 import top.colter.dynamic.core.plugin.PublisherLoginStatus
 import java.net.URI
 import kotlinx.coroutines.CancellationException
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.add
+import top.colter.dynamic.core.link.LinkVideoResource
 
 internal class WeiboLinkResolver(
     private val platformId: PlatformId,
@@ -109,15 +114,27 @@ internal class WeiboLinkResolver(
         val update = mapper.map(detail, fallbackPublisher())
             ?: return LinkResolution.Failed(parsedLink, "微博动态映射失败：${parsedLink.targetId}")
 
-        // 视频只是动态的一部分：卡片照常渲染正文与视频卡，附带视频仅用于按模板补发视频文件。
-        val attachedVideo = detail.findDownloadableVideo()?.let { detail.toAttachedVideoPreview(it) }
-        return LinkResolution.Dynamic(parsedLink, update, attachedVideo = attachedVideo)
+        // 卡片照常渲染正文与视频卡；可下载资源只参与本次统一模板执行。
+        val video = detail.findDownloadableVideo()?.let { card ->
+            LinkVideoResource(platformId, parsedLink.targetId, card.durationSeconds, buildJsonObject {
+                put("title", card.title)
+                put("mediaUrl", card.mediaUrl.orEmpty())
+                put("sources", buildJsonArray {
+                    card.videoSources.forEach { source -> add(buildJsonObject {
+                        put("quality", source.quality)
+                        put("url", source.url)
+                    }) }
+                })
+            })
+        }
+        return LinkResolution.Dynamic(parsedLink, update, video = video)
     }
 
     private suspend fun resolveUserPreview(parsedLink: ParsedLink): LinkResolution {
         val publisher = runCatching {
             publisherInfoResolver(parsedLink.targetId)
         }.getOrElse { error ->
+            if (error is CancellationException) throw error
             return LinkResolution.Failed(
                 parsedLink = parsedLink,
                 reason = error.message ?: "获取微博用户信息失败",
@@ -138,37 +155,6 @@ internal class WeiboLinkResolver(
                 cover = publisher.banner,
                 publisher = publisher,
             ),
-        )
-    }
-
-    private fun WeiboPostSnapshot.toAttachedVideoPreview(video: WeiboMediaCardSnapshot): LinkPreview {
-        val userId = userId.takeIf { it.isNotBlank() }
-        val publisher = userId?.let {
-            PublisherInfo(
-                key = PublisherKey.of(platformId.value, PublisherKind.USER, it),
-                name = screenName?.takeIf { name -> name.isNotBlank() } ?: "微博用户 $it",
-                avatar = MediaRef(avatarUrl?.takeIf { url -> url.isNotBlank() } ?: DEFAULT_WEIBO_AVATAR, MediaKind.AVATAR),
-            )
-        }
-        return LinkPreview(
-            platformId = platformId,
-            kind = LinkKinds.VIDEO,
-            id = postId,
-            url = url?.takeIf { it.isNotBlank() } ?: dynamicLink(postId),
-            title = video.title.takeIf { it.isNotBlank() }
-                ?: screenName?.takeIf { name -> name.isNotBlank() }?.let { name -> "${name}的微博视频" }
-                ?: "微博视频 $postId",
-            // 正文已经在动态卡片里渲染，这里只保留视频自身的简介，避免重复。
-            description = video.description,
-            badge = "视频",
-            cover = video.coverUrl?.takeIf { it.isNotBlank() }?.let { MediaRef(it, MediaKind.COVER) },
-            publisher = publisher,
-            metrics = listOfNotNull(
-                metrics.reposts?.let { DynamicMetric("repost", raw = it) },
-                metrics.comments?.let { DynamicMetric("comment", raw = it) },
-                metrics.likes?.let { DynamicMetric("like", raw = it) },
-            ),
-            durationSeconds = video.durationSeconds,
         )
     }
 

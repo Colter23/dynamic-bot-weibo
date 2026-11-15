@@ -1,5 +1,7 @@
 package top.colter.dynamic.weibo
 
+import kotlinx.serialization.json.jsonPrimitive
+
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
@@ -64,10 +66,11 @@ internal class WeiboClient(
     private val cookieJar: WeiboCookieJar = WeiboCookieJar(config.cookie),
     private val textTransport: (suspend (HttpRequest) -> HttpResponse<String>)? = null,
     private val sessionTimeoutMillis: Long = 60_000,
+    private val videoHttpClient: HttpClient? = null,
 ) {
     private var cachedLoginAccount: PublisherLoginAccount? = null
     private val videoDownloader by lazy {
-        WeiboVideoDownloader(defaultHttpClient(HttpClient.Redirect.NORMAL), DESKTOP_USER_AGENT)
+        WeiboVideoDownloader(videoHttpClient ?: defaultHttpClient(HttpClient.Redirect.NORMAL), DESKTOP_USER_AGENT)
     }
 
     suspend fun checkLoginState(expectedUserId: String? = null): PublisherLoginResult {
@@ -326,14 +329,32 @@ internal class WeiboClient(
     suspend fun downloadVideoLink(request: LinkVideoDownloadRequest): LinkVideoDownloadResult {
         val postId = request.parsedLink.targetId.trim()
         require(postId.isNotBlank()) { "微博动态 ID 不能为空" }
-        val post = fetchPostDetail(postId) ?: error("未找到微博视频动态：$postId")
-        val video = post.findDownloadableVideo()
-            ?: error("微博动态未提供可下载的视频地址：$postId")
-        return videoDownloader.download(
-            request = request,
-            video = video,
-            referer = "$WEIBO_HOME/detail/$postId",
-        )
+        val resolved = request.resource?.takeIf { it.platformId == request.parsedLink.platformId && it.id == postId }
+        val parameters = resolved?.downloadParameters
+        val cachedVideo = parameters?.let {
+            WeiboMediaCardSnapshot(
+                kind = WeiboMediaCardKind.VIDEO,
+                title = it["title"]?.jsonPrimitive?.content.orEmpty(),
+                mediaUrl = it["mediaUrl"]?.jsonPrimitive?.content,
+                durationSeconds = resolved.durationSeconds,
+                videoSources = (it["sources"] as? kotlinx.serialization.json.JsonArray).orEmpty().mapNotNull { entry ->
+                    val source = entry as? kotlinx.serialization.json.JsonObject ?: return@mapNotNull null
+                    val url = source["url"]?.jsonPrimitive?.content ?: return@mapNotNull null
+                    WeiboVideoSourceSnapshot(source["quality"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0, url)
+                },
+            ).takeIf { card -> card.selectVideoSource(request.quality) != null }
+        }
+        suspend fun refreshVideo(): WeiboMediaCardSnapshot =
+            (fetchPostDetail(postId) ?: error("未找到微博视频动态：$postId"))
+                .findDownloadableVideo() ?: error("微博动态未提供可下载的视频地址：$postId")
+        val video = cachedVideo ?: refreshVideo()
+        return try {
+            videoDownloader.download(request, video, "$WEIBO_HOME/detail/$postId")
+        } catch (error: WeiboVideoHttpException) {
+            // 只有已解析资源明确失效时才重取详情，网络错误与限流不额外访问平台。
+            if (cachedVideo == null || error.status !in setOf(403, 404)) throw error
+            videoDownloader.download(request, refreshVideo(), "$WEIBO_HOME/detail/$postId")
+        }
     }
 
     internal fun parsePostDetailResponse(json: String): WeiboPostSnapshot? {

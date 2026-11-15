@@ -75,7 +75,7 @@ internal class WeiboVideoDownloader(
         val response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream())
         response.body().use { input ->
             if (response.statusCode() !in 200..299) {
-                error("微博视频下载失败：status=${response.statusCode()}")
+                throw WeiboVideoHttpException(response.statusCode())
             }
             val contentType = response.headers().firstValue("Content-Type").orElse("")
             if (
@@ -147,3 +147,5 @@ internal class WeiboVideoDownloader(
         private const val DOWNLOAD_TIMEOUT_SECONDS: Long = 60
     }
 }
+
+internal class WeiboVideoHttpException(val status: Int) : IllegalStateException("微博视频下载失败：status=$status")

@@ -1,6 +1,7 @@
 package top.colter.dynamic.weibo
 
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CancellationException
 import top.colter.dynamic.core.data.DynamicContentNodeText
 import top.colter.dynamic.core.data.DynamicMediaCardKind
 import top.colter.dynamic.core.data.DynamicPayload
@@ -19,6 +20,7 @@ import top.colter.dynamic.core.plugin.PublisherLoginStatus
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -85,7 +87,7 @@ class WeiboLinkResolverTest {
         assertEquals("R1CXrAEh5", resolution.update.key.externalId)
         assertEquals("5977716744", resolution.update.publisher.externalId)
         // 没有视频的帖子不应附带可下载视频
-        assertNull(resolution.attachedVideo)
+        assertNull(resolution.video)
     }
 
     @Test
@@ -129,14 +131,14 @@ class WeiboLinkResolverTest {
         assertEquals(90, card.card.durationSeconds)
         assertEquals("https://example.com/video.mp4", card.card.mediaUri)
 
-        // 附带视频只服务于按模板补发视频：不写正文，携带时长与封面
-        val attachedVideo = assertNotNull(resolution.attachedVideo)
-        assertEquals(LinkKinds.VIDEO, attachedVideo.kind)
+        // 下载参数不参与展示，日志描述不能暴露媒体地址。
+        val attachedVideo = assertNotNull(resolution.video)
+        assertEquals(platformId, attachedVideo.platformId)
         assertEquals("R1CXrAEh5", attachedVideo.id)
-        assertEquals("测试视频", attachedVideo.title)
-        assertEquals("视频简介", attachedVideo.description)
+        assertEquals("\"测试视频\"", attachedVideo.downloadParameters["title"].toString())
         assertEquals(90, attachedVideo.durationSeconds)
-        assertEquals("https://example.com/cover.jpg", attachedVideo.cover?.uri)
+        assertTrue(attachedVideo.toString().contains("R1CXrAEh5"))
+        assertFalse(attachedVideo.toString().contains("video.mp4"))
     }
 
     @Test
@@ -149,6 +151,19 @@ class WeiboLinkResolverTest {
         assertEquals(LinkKinds.USER, resolution.preview.kind)
         assertEquals("测试用户", resolution.preview.title)
         assertEquals("5977716744", resolution.preview.publisher?.externalId)
+    }
+
+    @Test
+    fun `user lookup cancellation propagates without becoming a parse failure`(): Unit = runBlocking {
+        val cancellingResolver = WeiboLinkResolver(
+            platformId = platformId,
+            gatewayProvider = { FakeGateway(post) },
+            mapper = WeiboDynamicMapper(),
+            publisherInfoResolver = { throw CancellationException("cancelled") },
+        )
+        val parsed = assertNotNull(cancellingResolver.parseLink("https://weibo.com/u/5977716744"))
+
+        assertFailsWith<CancellationException> { cancellingResolver.resolveLink(parsed) }
     }
 
     @Test
