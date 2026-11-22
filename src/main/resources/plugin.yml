@@ -1,6 +1,6 @@
 id: weibo-publisher
 name: 微博动态源插件
-version: 0.0.5
+version: 0.0.6
 mainClass: top.colter.dynamic.weibo.WeiboPublisherPlugin
 apiVersion: 5.0.0
 description: 微博动态轮询、发布者资料查询、关注分组与订阅分发插件。
